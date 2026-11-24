@@ -241,7 +241,10 @@ the cache, every prompt and most of the experts, the second the experts it does 
 RDNA 3 / 3.5 / 4 card first is faster, the setup offers it so) - not validated on AMD yet. Run
 by Maya's team on a
 Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
-starts; Radeon RX 5000 / 6000 / 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs
+starts; Radeon RX 5000 / 6000 / 7000 / 9000 cards build the same engine - RDNA 1 / 2 (gfx1030) takes the portable
+kernels, no matrix cores. Two cards ran the split on two 16 GB cards (an RX 6800 gfx1030 + an RX 9070 gfx1201, Linux):
+about 64 tok/s with the RDNA 4 card first against 44 with the RDNA 2 card first (32K context, FP8 cache, 8 tokens;
+not validated on AMD yet). Older AMD GPUs
 (the GCN cards) and AMD
 under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
 

@@ -1,0 +1,2 @@
+ik2 drafting v1|AMD Radeon RX 9070 17 GB sm_120|driver 71626385|Inkling-2-Mini-UD-Q4_K_XL.gguf 17629759456|drafter 402278560|ctx 262144 fp8	30.012 30.029 30.868 30.624 0 2026-11-23
+ik2 drafting v1|AMD Radeon RX 9070 17 GB sm_120|driver 71626385|Inkling-2-Mini-UD-Q4_K_XL.gguf 17629759456|drafter 402278560|ctx 262144 fp8|gpu1 AMD Radeon RX 6800 17 GB sm_103	67.844 70.127 74.941 77.594 3 2026-11-24

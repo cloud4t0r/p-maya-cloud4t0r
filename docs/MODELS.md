@@ -304,23 +304,25 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA V100 / RTX 20 and newer, or AMD RDNA 1 / 2 (Radeon RX 5000 / 6000) and RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); Linux; NVIDIA with 8 GB of VRAM or more (experts that do not fit stay in RAM: about 13 GB of RAM with an 8 GB card), AMD with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU with 24 GB (every expert in memory); one or two GPUs (the second holds the experts the first does not); Windows is not supported yet |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA V100 / RTX 20 and newer (Linux and Windows, one or two GPUs on Linux), or AMD RDNA 1 / 2 (Radeon RX 5000 / 6000) and RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max) on Linux; NVIDIA with 8 GB of VRAM or more (experts that do not fit stay in RAM: about 13 GB of RAM with an 8 GB card), AMD with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU with 24 GB (every expert in memory); one or two GPUs (the second holds the experts the first does not); Windows is NVIDIA-only |
 
 - **Where it runs:** one GPU, or two (the split - the first holds the dense weights, the cache and every prompt, the
-  second the experts it does not hold). The setup says so in one line and stops on a Mac, Windows, three GPUs or more,
-  NVIDIA cards older than V100 / RTX 20, AMD GPUs older than RDNA, NVIDIA GPUs under 8 GB and AMD GPUs under 12 GB.
-- **AMD (`--backend hip`):** run by Maya's team on a Radeon 8065S (Gorgon Halo, Linux); Radeon RX 5000 / 6000 and
-  7000 / 9000 cards build the same engine but have not been run here yet (RDNA 1 / 2 without matrix cores: the
-  portable kernels) - tell us how it goes. Two AMD cards (mixed generations too) run the split; the first card runs
-  every prompt and most of the experts, so the setup offers an RDNA 3 / 3.5 / 4 card first (`--gpus 1,0`, `--gpus 0,1`
-  pick the order).
+  second the experts it does not hold). The setup says so in one line and stops on a Mac, on AMD on Windows, on two GPUs on Windows, on three GPUs or
+  more, NVIDIA cards older than V100 / RTX 20, AMD GPUs older than RDNA, NVIDIA GPUs under 8 GB and AMD GPUs under 12 GB.
+- **AMD (`--backend hip`):** run by Maya's team on a Radeon 8065S (Gorgon Halo, Linux). Radeon RX 5000 / 6000 and
+  7000 / 9000 cards build the same engine - RDNA 1 / 2 (gfx10) has no matrix cores, so it takes the portable
+  kernels; the split ran on two 16 GB cards (an RX 6800 gfx1030 + an RX 9070 gfx1201), about 64 tok/s with the RDNA 4
+  card first against 44 with the RDNA 2 card first (32K context, FP8 cache, 8 tokens), but two cards are not validated
+  on AMD yet. Two AMD cards (mixed generations too) run the split; the first card runs every prompt and most of the
+  experts, so the setup offers an RDNA 3 / 3.5 / 4 card first (`--gpus 1,0`, `--gpus 0,1` pick the order). Tell us how
+  your own card goes.
 - **Context:** up to 256K (the setup offers 32K to 256K and recommends the largest that keeps every expert in VRAM on
   the card - on two cards, the largest whose split keeps them all across the two); the cache in FP8 by default (F16 on
   the Models page).
-- **Drafting:** on by default where it runs (NVIDIA RTX 30 and newer with every expert in VRAM, and AMD) - the setup
-  fetches the model's own drafter from Maya's repo (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB;
-  `--drafting off` skips it). The model checks every
-  drafted token, so the answers are the same with drafting or without.
+- **Drafting:** on by default where it runs (every card the engine runs on, one or two, NVIDIA and AMD - the first
+  start measures it once and keeps the faster choice) - the setup fetches the model's own drafter from Maya's repo
+  (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB; `--drafting off` skips it). The model checks every drafted token, so the
+  answers are the same with drafting or without.
 - **Thinking and tools:** thinkingmachines' own template; its effort levels Off, Low, Medium, High (its default) and
   Max. Tool calls through Maya's OpenAI-compatible server.
 - **Pictures:** on by default - the setup fetches the model's vision tower (`mmproj-Inkling-2-Mini-BF16.gguf`, 0.6 GB, from Maya's repo - unsloth's file byte for byte, a copy you already have is kept; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives

@@ -1,1 +1,1 @@
-run-maya-ds4-hip.sh
+run-maya-inkling-2-mini.sh

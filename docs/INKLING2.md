@@ -303,7 +303,7 @@ slope deep in a context is the attention reading the cache: about 16 KB a token 
 (87% of its 900 GB/s; every expert in VRAM at 600K: 86.0 / 80.1 / 58.8 / 44.2 tok/s at 2K / 32K / 256K / 512K).
 KV streaming (`--kv-streaming auto`, the default; `on` / `off`, `--kv-resident N`) is the last resort, where the
 cache alone does not fit beside the dense weights and half a GiB of tier (an 8 / 12 GB card past 256K, a 16 GB one
-at 1M), and on AMD (no offload path yet: every expert stays): the cache of all but N (at least 1) of the eight full
+at 1M), and on an AMD APU (its memory is the RAM, no offload path there: every expert stays): the cache of all but N (at least 1) of the eight full
 visits sits in pinned RAM. A token copies those rows by DMA into a small VRAM ring, a few of the attention kernel's
 blocks a slot, the copies running ahead of the kernels (their partials those of the whole launch); a prompt chunk
 copies a visit's rows into one VRAM staging pair first - the VRAM of one of the N visits (the swing visit: its rows
@@ -438,15 +438,16 @@ hold are pinned (Linux and Windows - Windows maps each pinned run at a device ad
 finds an expert through a table of them): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
 the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
 ~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
-24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
-the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
+24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting runs on the offload path where the whole cache stays in VRAM - where part of the cache streams from RAM or
+under lane parity (`IK2_LANE` by hand), it stays off with a NOTE.
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one or two NVIDIA GPUs of 8 GB or more (two are Linux only; one is on Windows, two are untested there), sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
 (sm_100 / sm_120) compile-checked only; Windows run on an RTX 3050 8 GB (@cobra91's MSVC port, its VRAM as CUDA gets it
 measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
-`--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
-tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
+`--serve` also as a `NOTE` the server prints): no GPU, a build with no kernels for the GPU's arch, an NVIDIA GPU older
+than sm_70 (Pascal and before: none of the tensor-core instructions its kernels use), an AMD GPU that is not an
+RDNA (gfx10 / gfx11 / gfx12), less than 7 GiB of VRAM (an AMD discrete card under 12 GB, an APU under 24 GB),
 `--gpus 3` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU
 modes (`IK2_EP=1` or `IK2_TP=1`, section 6) - untested here.
 
