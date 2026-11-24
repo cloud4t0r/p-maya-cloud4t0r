@@ -474,7 +474,7 @@ class Gate(unittest.TestCase):
     def test_amd_on_linux_goes_to_the_amd_check(self):
         why, said = self.check("hip")
         self.assertEqual(why, "")
-        self.assertEqual(said, [("hip", {"text_only": False})])       # (pictures: the tower runs on HIP too)
+        self.assertEqual(said, [("hip", {"text_only": False, "ik2": False})])   # (pictures: the tower runs on HIP too)
 
     def test_amd_on_windows_experimental(self):
         """Windows + AMD: said once to be experimental, then the AMD check as on Linux (no stop, no extra question)."""
@@ -484,7 +484,7 @@ class Gate(unittest.TestCase):
         self.assertIn("Hy4-Flash on an AMD GPU under Windows is experimental: Maya's team has not tested it there",
                       said[0])
         self.assertIn("docs/AMD_MAYA.md", said[0])
-        self.assertEqual(said[1], ("hip", {"text_only": False}))
+        self.assertEqual(said[1], ("hip", {"text_only": False, "ik2": False}))
 
     def test_mac(self):
         why, _ = self.check("metal")
@@ -2431,7 +2431,7 @@ class Setup(unittest.TestCase):
                 patch.object(maya.sys, "platform", "linux"), \
                 patch.object(maya, "check_hip_pc", return_value={"backend": "hip"}) as hip:
             self.assertEqual(maya.check_pc(a, "hy4"), {"backend": "hip"})
-        hip.assert_called_once_with(a, text_only=False)
+        hip.assert_called_once_with(a, text_only=False, ik2=False)
 
 
 class Dashboard(unittest.TestCase):

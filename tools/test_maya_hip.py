@@ -139,6 +139,24 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["env"]["MAYA_HIPBLASLT_TUNING"],
                          f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
+    def test_inkling2_takes_two_amd_cards_and_keeps_their_order(self):
+        """Inkling-2-Mini on AMD: one card or two - the split.  --gpus keeps the order given (GPU 0 holds the dense
+        weights, the cache and every prompt; GPU 1 the experts), where the other models put the larger card first;
+        without --gpus, two 16 GB cards are the recommended answer (each alone runs the offload path), an RDNA 3 / 4
+        card first since it runs every prompt and most of the experts on its matrix cores."""
+        self.a.gpus = "1,0"
+        pc = maya.check_pc(self.a, "ik2")
+        self.assertEqual([g["index"] for g in pc["gpus"]], [1, 0])
+        self.gpus[:] = [{"index": 0, "arch": "gfx1030", "vendor": "amd", "name": "RX 6800", "vram_gb": 16},
+                        {"index": 1, "arch": "gfx1201", "vendor": "amd", "name": "RX 9070", "vram_gb": 16}]
+        self.a.gpus = self.a.gpu = None
+        self.a.yes, self.a.check = True, False            # (the recommended answer: the two cards, the RDNA 4 first)
+        pc = maya.check_pc(self.a, "ik2")
+        self.assertEqual([g["index"] for g in pc["gpus"]], [1, 0])
+        self.a.gpus = "0,1"                               # (as asked: the order stands)
+        pc = maya.check_pc(self.a, "ik2")
+        self.assertEqual([g["index"] for g in pc["gpus"]], [0, 1])
+
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
         self.a.env = ["MAYA_GLM_RESERVE_MB=4096"]

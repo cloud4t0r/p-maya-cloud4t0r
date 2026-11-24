@@ -16,8 +16,9 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
   Inkling-2-Mini (maya-ik2, an experimental preview - it stops at a flag it does not know, only its own are written):
-             kv ("fp8" | "f16": IK2_KV); one GPU, one answer at a time, text only, no drafting offered for now; whether
-             a context keeps every expert in VRAM: tools/ik2_fit.py, the setup's
+             kv ("fp8" | "f16": IK2_KV); gpus (one, or two - the split); parallel (answers at once); draft ("auto" |
+             "dspark" | "none"); images (the setup's maya-vision entry); whether a context keeps every expert in VRAM
+             on the card or across two: tools/ik2_fit.py, the setup's
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -1020,11 +1021,18 @@ def describe(path: Path, running: str | None) -> dict:
         own.update(kv_small_from=min(small) if small else None,
                    context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
     if ik2:
-        # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card, by the cache's format; the
-        #  page says where the engine would run its slower path)
+        # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card(s), by the cache's format; the
+        #  page says where the engine would run its slower path - two cards: the split, the first card's tier and the
+        #  experts the second holds)
         vram = ik2_vram_gb(cfg)
+        ids = gpus_of(cfg) or [0]
+        card1 = next((g for g in machine_gpus("hip" if cfg.get("backend") == "hip" else "cuda")
+                      if g.get("index") == ids[1]), None) if len(ids) == 2 else None
+        vram1 = float((card1 or {}).get("vram_gb") or 0)
         ctxs = sorted({*IK2F.CONTEXTS, int(cur.get("context") or 0)} - {0})
-        own.update(ik2_fit={kv: {str(c): {k: v for k, v in IK2F.plan(vram, c, kv, ik2_apu(cfg)).items() if k != "need_gib"}
+        plan = (lambda c, kv: IK2F.plan_two(vram, vram1, c, kv)) if vram1 else \
+            (lambda c, kv: IK2F.plan(vram, c, kv, ik2_apu(cfg)))
+        own.update(ik2_fit={kv: {str(c): {k: v for k, v in plan(c, kv).items() if k != "need_gib"}
                                  for c in ctxs} for kv in IK2F.KV_BYTES} if vram else None,
                    ik2_kv_bytes=IK2F.KV_BYTES)
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),

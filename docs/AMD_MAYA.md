@@ -232,12 +232,17 @@ Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo,
 
 ### Inkling-2-Mini (experimental preview)
 
-`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA 3 / 3.5 / 4
-GPU (gfx11 / gfx12) with 12 GB of VRAM or more - under 24 GB the experts the card does not hold stay in RAM (about 9 GB
+`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA GPU
+(gfx10 / gfx11 / gfx12) with 12 GB of VRAM or more - RDNA 1 / 2 cards (RX 5000 / 6000) take the portable kernels, no
+matrix cores; under 24 GB the experts the card does not hold stay in RAM (about 9 GB
 of RAM with a 12 GB card) - or a Strix Halo / Gorgon Halo, whose memory is the RAM and holds the whole model (the
-setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
+setup counts what the system leaves, less max(8 GB, 10%)). Two cards run the split (the first holds the dense weights,
+the cache, every prompt and most of the experts, the second the experts it does not; mixed generations too - an
+RDNA 3 / 3.5 / 4 card first is faster, the setup offers it so) - not validated on AMD yet. Run
+by Maya's team on a
 Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
-starts; Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs and AMD
+starts; Radeon RX 5000 / 6000 / 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs
+(the GCN cards) and AMD
 under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
 
 ## Instinct MI300X / MI325X

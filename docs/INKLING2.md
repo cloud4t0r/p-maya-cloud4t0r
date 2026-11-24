@@ -450,7 +450,9 @@ tensor-core instructions its kernels use), a build with no kernels for the GPU's
 `--gpus 3` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU
 modes (`IK2_EP=1` or `IK2_TP=1`, section 6) - untested here.
 
-**Two NVIDIA GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first): where the
+**Two GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first; on AMD the order
+given is kept, and an RDNA 3 / 3.5 / 4 card is offered first where the two generations differ - it runs every prompt
+and most of the experts on its matrix cores): where the
 first card holds every expert it runs alone (the resident path - faster there than the split: 2x V100 32 GB, one card
 86.7 tok/s against ~74 with the experts split). Else the split: the first card runs the offload path (the dense
 weights, the K / V cache, every prompt, its tier of the experts), the second holds the next experts by the profile's
@@ -463,8 +465,9 @@ offers it, the IOMMU translates neither card and a test copy at load arrives int
 (`IK2_HOST_STAGE=1` forces that; the same answers). Drafting runs on two cards too (GPU 1's share of a verify window is computed there and its
 rows sent back - the split's plain answers; `--drafting auto` measures it). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
 tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
-second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers one card (two
-are untested there). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
+second card's experts from RAM, so they run at the offload path's speed. On Windows the setup offers NVIDIA one card
+(two are untested there); on AMD (Linux) it offers one or two as well. CMake skips `maya-ik2` without a CUDA arch of 70
+or more in the list (`-DMAYA_IK2_WINDOWS=OFF`:
 not on Windows).
 
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
@@ -474,12 +477,20 @@ experts in three launches straight from their blocks (`IK2_RDNA_MOE=0`: off) and
 memory (`IK2_RDNA_FLASH=0`: off); the other FP16 GEMMs take hipBLASLt's kernel measured once per shape, kept in
 `lt-picks.txt` beside the GGUF (`IK2_LT_STORE` names another file). Tokens take the scalar expert kernels
 (`IK2_EXPERT_MMA=1`: the mma layout). Answers repeat on a GPU (every sum in a fixed order) but are not CUDA's bits.
-The engine refuses an AMD GPU older than RDNA 3 at its start; on an APU (Strix / Gorgon Halo) it counts the RAM the
+RDNA 1 / 2 cards (`gfx10`: RX 5000 / 6000, Radeon PRO V620 / W6800) have no matrix cores: they run the portable kernels
+for the prompt attention and the experts (the log's NOTE says so); the rest is the same path.
+On an APU (Strix / Gorgon Halo) the engine counts the RAM the
 system has available, less max(8 GiB, 10%), as the GPU's room, and keeps every expert there. A discrete AMD card from
 12 GB takes the offload path below 24 GB as on NVIDIA (a tier in VRAM from the profile, the rest pinned in RAM through
 `hipHostRegister`, the whole cache in VRAM, the prompt's experts on the matrix cores a batch of the staging ring at a
 time): mode A only by default - the resident path's expert kernels, so the same greedy answers as with every expert in
-VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. Run on a Radeon 8065S (Ubuntu, ROCm
+VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. Two cards (`--gpus 2`, Linux) run the
+split above like two NVIDIA cards - an RDNA 1 / 2 card beside an RDNA 3 / 3.5 / 4 one too (each card's kernels are the
+build's); it is not validated on AMD yet (`NOTE` at the start, the setup says so). The setup puts an RDNA 3 / 3.5 / 4
+card first where the two differ (the order given stands): the first card holds the dense weights, the cache, every
+prompt and most of the experts, so its matrix cores speed the whole answer - two 16 GB cards (RX 6800 + RX 9070) gave
+about 64 tok/s with the 9070 first against 44 with the 6800 (32K context, FP8 cache, 8 tokens; prompts too short to
+compare). Run on a Radeon 8065S (Ubuntu, ROCm
 7.1), also set as a 12 and a 16 GB card (`IK2_VRAM_GB`: on an APU the free figures are capped, no ballast).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).

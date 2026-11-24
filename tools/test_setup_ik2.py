@@ -1,8 +1,9 @@
 """tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
 its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
-does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
-one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
-config it writes (its pictures too) and a start of it.  No GPU, no network.
+does not run on (a Mac, Windows + AMD, three GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB,
+an AMD card that is not RDNA or with less memory), the GPU(s) it picks (two cards: the split), what fits on the card
+(the context, the drafter's room), the picker's row, the tokenizer step, the config it writes (its pictures too) and a
+start of it.  No GPU, no network.
 
     python -m unittest tools.test_setup_ik2 -v
 """
@@ -156,9 +157,10 @@ class Refusals(unittest.TestCase):
         cases = [
             ("metal", False, 0, [], "NVIDIA and AMD GPUs only"),
             ("hip", True, 0, [], "Linux only"),
-            ("hip", False, 2, [], "on AMD runs on one GPU"),
-            ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
+            ("hip", False, 3, [], "one or two GPUs"),
+            ("hip", False, 0, [amd("gfx90a", 16)], "older GCN"),
             ("hip", False, 0, [amd("gfx1102", 8)], "12 GB of VRAM or more"),
+            ("hip", False, 2, [amd("gfx1030", 16, 0), amd("gfx1102", 8, 1)], "12 GB of VRAM or more on each"),
             ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "APU with 24 GB"),
             ("cuda", True, 2, ok, "two are Linux only"),
             ("cuda", False, 3, ok, "one or two NVIDIA GPUs"),
@@ -179,13 +181,20 @@ class Refusals(unittest.TestCase):
             self.assertIsNone(F.unsupported("cuda", True, 1, cards))   # (Windows + NVIDIA: as on Linux)
         for cards in ([card(12, arch="86"), card(12, 1, arch="86")], [card(8, arch="70"), card(8, 1, arch="70")], []):
             self.assertIsNone(F.unsupported("cuda", False, 2, cards))   # (two cards: the split)
-        # (AMD on Linux: RDNA 3 / 3.5 / 4 from 12 GB - the offload path under 24 - or an APU whose shared memory
-        #  leaves 24 GB)
-        for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
-                      [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], [amd("gfx1201", 16)],
-                      [amd("gfx1101", 12)], []):
+        # (AMD on Linux: RDNA 1 / 2 with the portable kernels and RDNA 3 / 3.5 / 4 with the matrix cores - one card
+        #  from 12 GB then (the offload path under 24), or two cards (the split, each from 12 GB); an APU whose shared
+        #  memory leaves 24 GB)
+        singles = ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16)], [amd("gfx1201", 16)],
+                   [amd("gfx1101", 12)], [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], [])
+        pairs = ([amd("gfx1030", 16, 0), amd("gfx1201", 16, 1)],
+                 [amd("gfx1100", 24, 0), amd("gfx1201", 16, 1)],
+                 [amd("gfx1030", 16), amd("gfx1100", 24, 1)])
+        for cards in singles:
             self.assertIsNone(F.unsupported("hip", False, 1, cards))
             self.assertIsNone(F.unsupported("hip", False, 1, cards, 32.0))
+        for cards in pairs:
+            self.assertIsNone(F.unsupported("hip", False, 2, cards))
+            self.assertIsNone(F.unsupported("hip", False, 2, cards, 62.0))
         # (a 12 GB card with 8 GB of RAM: the experts it does not hold need the RAM)
         self.assertIn("RAM and VRAM together", F.unsupported("hip", False, 1, [amd("gfx1101", 12)], 8.0))
 
@@ -341,6 +350,15 @@ class TwoCards(unittest.TestCase):
         q = F.plan_two(8.0, 8.0, 32768)
         self.assertEqual(q["layout"], "split+ram")
         self.assertLess(q["tier_gib"] + q["gpu1_gib"], F.EXPERTS_GIB)
+        # (two 16 GB cards - the RX 6800 + RX 9070 pair: every expert across them at 262K)
+        p = F.plan_two(16.0, 16.0, 262144)
+        self.assertEqual((p["gpus"], p["layout"]), (2, "split"))
+        self.assertAlmostEqual(p["tier_gib"] + p["gpu1_gib"], F.EXPERTS_GIB, places=1)
+        self.assertEqual(F.verdict_two(16.0, 16.0, 64.0, 262144)[0], "fast")
+        # (the context the setup recommends: the largest whose split keeps every expert across the two; one card
+        #  that already holds them all keeps its own)
+        self.assertEqual(F.recommended_context_two(16.0, 16.0), 262144)
+        self.assertEqual(F.recommended_context_two(24.0, 16.0), F.recommended_context(24.0))
         self.assertEqual(F.verdict_two(12.0, 12.0, 64.0, 32768)[0], "fast")
         self.assertEqual(F.verdict_two(8.0, 8.0, 64.0, 32768)[0], "runs")
         self.assertEqual(F.verdict_two(8.0, 8.0, 8.0, 32768)[0], "does not fit")
@@ -441,6 +459,16 @@ class Steps(unittest.TestCase):
             cfg = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(cfg["args"][4:], want, how)
             self.assertEqual(cfg["installer"]["drafting"], {"measure": "auto", None: "auto"}.get(how, how))
+        # (two AMD cards: the split - --gpus 2, the two GPUs in the config's order, the offload path's profile seeded)
+        amd_pc = {"gpus": [amd("gfx1030", 16, 0), amd("gfx1201", 16, 1)], "backend": "hip"}
+        with patch.object(maya, "ROOT", self.root), \
+                patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
+            path = maya.write_config_ik2(args(), amd_pc, {}, gguf, tok, 65536, self.root / "models", d)
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536", "--gpus", "2",
+                                       "--drafting", "auto"])
+        self.assertEqual((cfg["gpu"], cfg["backend"]), ([0, 1], "hip"))
+        self.assertEqual(cfg["env"].get("IK2_WARM"), str(maya.IK2_PROFILE) if maya.IK2_PROFILE.is_file() else None)
 
     def test_drafter_step(self):
         """Drafting on by default: the drafter beside the GGUF, sha256-checked; none with --drafting off or a declined

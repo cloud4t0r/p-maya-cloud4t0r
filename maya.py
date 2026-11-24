@@ -870,8 +870,9 @@ HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
 # kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
-# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
-# offload path under 24 GB) or a Halo / APU with 24 GB.
+# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 1 / 2 (the portable kernels, no
+# matrix cores) and RDNA 3 / 3.5 / 4 from 12 GB (the same offload path under 24 GB, two cards: the split), or a
+# Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; its drafter from Maya's own repo (download.json's "drafter", ik2_drafter_step).  Pictures: the
 # model's vision tower as the mmproj-Inkling-2-Mini-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
@@ -1327,7 +1328,7 @@ def vs_2026(vcvars) -> bool:
     return vcvars is not None and any(p.isdigit() and 18 <= int(p) < 1000 for p in PureWindowsPath(str(vcvars)).parts)
 
 
-def check_hip_pc(a, installed=False, text_only=True) -> dict:
+def check_hip_pc(a, installed=False, text_only=True, ik2=False) -> dict:
     """a.gpus_before: the GPUs this model's config ran on - a setup again without --gpu / --gpus keeps them."""
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
@@ -1372,14 +1373,41 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         for i, g in zip(want, picked):
             if g is None:
                 fail(f"GPU {i} is not a supported AMD card")
-        # A mixed pair puts the discrete GPU first and the unified-memory APU last.
-        chosen = sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
+        # A mixed pair puts the discrete GPU first and the unified-memory APU last - but Inkling-2-Mini's split is not
+        # symmetric: its first GPU holds the dense weights, the cache and every prompt, so --gpus keeps the order given
+        chosen = picked if ik2 else sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
     else:
         one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
             usable, key=lambda g: g["vram_gb"])
         if one is None:
             fail(f"GPU {a.gpu} is not a supported AMD card")
         chosen = [one]
+        if ik2 and a.gpu is None and not WIN:
+            # (Inkling-2-Mini on AMD: one card, or two - the split.  Recommended: one where the largest holds every
+            #  expert at the smallest context, else the two largest - a 16 GB card alone runs the offload path, the
+            #  two hold every expert across them.  The first card runs the dense weights, the cache, every prompt and
+            #  most of the experts: an RDNA 3 / 3.5 / 4 card there (the matrix cores) is measured much faster than an
+            #  RDNA 1 / 2 one - 2x 16 GB: ~64 against ~44 tok/s - so it goes first)
+            big = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
+            two = sorted(big[:2], key=lambda g: (0 if str(g["arch"]).startswith(("gfx11", "gfx12")) else 1,
+                                                 -round(g["vram_gb"]), g["index"]))
+            if len(two) == 2 and not hip_unified_memory(two[0]):
+                p = IK2F.plan_two(two[0]["vram_gb"], two[1]["vram_gb"], IK2F.CONTEXTS[0])
+                rec = 0 if p["gpus"] == 1 else 1
+                held = IK2F.plan(big[0]["vram_gb"], IK2F.CONTEXTS[0])
+                labels = [f"{gpu_label(big[0])} only" + (
+                              " - it holds every expert" if p["gpus"] == 1 else
+                              f" - about {held['tier_gib']:.0f} of the experts' {IK2F.EXPERTS_GIB:.0f} GB in VRAM, "
+                              "the rest in RAM"),
+                          f"{gpu_label(two[0])} + {gpu_label(two[1])} together - the second holds the experts the "
+                          "first does not" + (" (every expert in VRAM)" if p["layout"] == "split" else "")]
+                pick = choose("Which GPUs?",
+                              [f"{IK2_SHOWN} runs on one GPU, or on two: the first holds the dense weights, the cache "
+                               "and every prompt,", "the second the experts the first does not (three or more: not "
+                               "yet)."],
+                              [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)],
+                              rec, a.yes or a.check)
+                chosen = [big[0]] if pick == 0 else two
     if WIN:
         # no ROCm SDK, or Maya's without the library kernels (rocm-sdk-device-<arch>) for a chosen GPU: offered once,
         # then checked again with ROCm there (its hipInfo numbers the GPUs as HIP does)
@@ -1428,7 +1456,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower). "
              "MAYA_GLM_CPU_LANE=0 turns it off")
     total, avail = mem_gb()
-    split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
+    split = f"{len(chosen)} GPUs ({'expert split' if ik2 else 'layer split'})" if len(chosen) > 1 else "one GPU"
     ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; HIP, {split}" +
        (", text only" if text_only else ""))
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
@@ -1718,7 +1746,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     ik2 = family == "ik2"
-    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
+    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA or AMD, Linux, one or two GPUs - refused in one line
+              #  before anything, where the preview does not run)
         why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [])
         if why:
             fail(why)
@@ -1731,7 +1760,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not (mm3 or hy4 or ik2))   # (Inkling 2: pictures on AMD too)
+        return check_hip_pc(a, text_only=not (mm3 or hy4 or ik2), ik2=ik2)   # (Inkling 2: pictures on AMD too)
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -11508,8 +11537,8 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
-    two = len(pc.get("gpus") or []) == 2 and pc.get("backend") != "hip"
-    args += ["--gpus", "2"] if two else []           # (the split: the config's two GPUs, the larger first)
+    two = len(pc.get("gpus") or []) == 2
+    args += ["--gpus", "2"] if two else []           # (the split: the config's two GPUs, the first on the offload path)
     how = ik2_drafting(a)
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
@@ -11584,11 +11613,11 @@ def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
-    run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
-    GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
-    (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
-    sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
-    config."""
+    run: a Mac, AMD on Windows, three GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
+    GPU that is not RDNA (gfx10 / gfx11 / gfx12) or with less memory - an APU counts the RAM it shares, less what is
+    kept free; two cards on AMD: the split), the context (the largest that keeps every expert in VRAM on this card),
+    the engine (build/maya-ik2), the files (pinned, sha256-checked), the tokenizer with the model's own template, the
+    pictures (its mmproj and maya-vision), the config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -11597,16 +11626,25 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     vram = float(pc["gpus"][0].get("vram_gb") or 0)
     amd = pc.get("backend") == "hip"
     apu = False
-    if amd:   # (AMD, Linux: RDNA 3 / 3.5 / 4 - a card from 12 GB, the offload path under 24; an APU's memory is the RAM)
-        g = dict(pc["gpus"][0])
-        if hip_unified_memory(g):
-            ram = mem_gb()[0]
-            g.update(unified_memory=True, memory_gb=apu_memory(vram, ram, not WIN) - apu_margin_gb(ram))
-            vram = g["memory_gb"]
-            apu = True
-        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g], mem_gb()[0])
+    if amd:   # (AMD, Linux: RDNA 1 / 2 with the portable kernels, RDNA 3 / 3.5 / 4 with the matrix cores - a card
+              #  from 12 GB, the offload path under 24; an APU's memory is the RAM; two cards: the split)
+        cards = []
+        for i, g0 in enumerate(pc["gpus"]):
+            g = dict(g0)
+            if i == 0 and hip_unified_memory(g):
+                ram = mem_gb()[0]
+                g.update(unified_memory=True, memory_gb=apu_memory(vram, ram, not WIN) - apu_margin_gb(ram))
+                vram = g["memory_gb"]
+                apu = True
+            cards.append(g)
+        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), cards, mem_gb()[0])
         if why:
             fail(why)
+        if len(cards) == 2 and not (str(cards[0].get("arch") or "").startswith(("gfx11", "gfx12"))) and \
+                any(str(g.get("arch") or "").startswith(("gfx11", "gfx12")) for g in cards[1:]):
+            warn("the first GPU runs the dense weights, the cache, every prompt and most of the experts: its RDNA 1 / 2 "
+                 "portable kernels (no matrix cores) make prompts and answers slower - --gpus 1,0 puts the RDNA 3 / "
+                 "3.5 / 4 card first")
     else:   # (Windows: the card as CUDA gets it, measured - the figure the engine plans with)
         room, how = ik2_engine_vram(pc)
         if how:
@@ -11618,20 +11656,22 @@ def set_up_ik2(a, prev: dict) -> Path | None:
          "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
          "an issue" if not amd else
          f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
-         "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes "
-         "in an issue")
+         "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 5000 / 6000 / 7000 / 9000 cards nor on two "
+         "AMD cards (the split) - tell us how it goes in an issue")
     m = ik2_entry()
     ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
        "(Apache 2.0)")
     kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
-    rec = IK2F.recommended_context(vram, kv)
+    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if len(pc["gpus"]) == 2 else 0.0
+    rec = (IK2F.recommended_context_two(vram, vram1, kv) if vram1 else IK2F.recommended_context(vram, kv))
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
-    fit = IK2F.plan(vram, ctx, kv, apu)
+    fit = IK2F.plan_two(vram, vram1, ctx, kv) if vram1 else IK2F.plan(vram, ctx, kv, apu)
     kv_gb = ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30
-    ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
+    ok(f"context: {ctx} tokens" + (" (recommended for these cards' VRAM)" if ctx == rec and vram1 else
+                                   " (recommended for this card's VRAM)" if ctx == rec else "") +
        (f"; its cache: {kv_gb:.1f} GB ({kv.upper()}), about {fit['kv_ram_gib']:.0f} GB of it in RAM (KV streaming)"
-        if fit.get("kv_streamed") else f"; its cache: {kv_gb:.1f} GB of VRAM ({kv.upper()})"))
-    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if len(pc["gpus"]) == 2 and not amd else 0.0
+        if fit.get("kv_streamed") else f"; its cache: {kv_gb:.1f} GB of VRAM ({kv.upper()})" +
+        (" on the first card" if vram1 and fit.get("gpus") == 2 else "")))
     if vram1:   # (two GPUs: the first alone where it holds every expert, else the split)
         word, line = IK2F.verdict_two(vram, vram1, mem_gb()[0], ctx, kv)
         if IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 1:
@@ -11659,7 +11699,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     meta = build_step(a, pc, llama, "maya-ik2")        # 4
     if not IK2_EXE.exists():
         fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
-             + ("an RDNA 3 / 3.5 / 4 GPU in the build's list, on Linux)" if amd else
+             + ("an RDNA GPU (gfx10 / gfx11 / gfx12) in the build's list, on Linux)" if amd else
                 "a V100 / RTX 20 or newer card in the build's GPU list)"))
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:

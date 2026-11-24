@@ -1,5 +1,5 @@
-"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 (an experimental preview): what fits on one card, for the setup
-(maya.py) and the Models page (serve/models.py) alike.
+"""tools/ik2_fit.py - Inkling-2-Mini on maya-ik2 (an experimental preview): what fits on one card, or across two,
+for the setup (maya.py) and the Models page (serve/models.py) alike.
 
 maya-ik2 keeps every expert of Inkling-2-Mini in VRAM where they fit (the resident token path, docs/INKLING2.md 8);
 where they do not - a card under 24 GB (NVIDIA from 8 GB, AMD from 12 GB), or a context past what one holds - it takes
@@ -42,7 +42,9 @@ AMD_APU_MIN_GB = 22.0                               # an AMD APU: every expert i
 MIN_TOTAL_GB = 24.0                                 # RAM + VRAM that hold the model, as the refusal says it (no SSD
                                                     # tier): the floor itself is the RAM a card leaves (ram_gib)
 MIN_CC = 70                                         # the engine's kernels: Volta on (V100: mma.m8n8k4; RTX 20, Ampere on)
-AMD_ARCHS = ("gfx11", "gfx12")                      # AMD: RDNA 3 / 3.5 / 4 - the matrix-core prompt kernels (HIP)
+AMD_ARCHS = ("gfx10", "gfx11", "gfx12")             # AMD: RDNA 1 / 2 (gfx10: the portable kernels, no matrix
+                                                    # cores), RDNA 3 / 3.5 / 4 (gfx11 / gfx12: the matrix-core
+                                                    # prompt kernels, HIP)
 
 
 def need_gib(ctx: int, kv: str = DEFAULT_KV) -> float:
@@ -97,8 +99,8 @@ TWO_ROOM_GIB = 0.3                                  # the second card's room bes
 
 
 def plan_two(vram0_gb: float, vram1_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
-    """Two NVIDIA cards (maya-ik2 --gpus 2, the larger first): the first alone where it holds every expert (the
-    resident path - faster there than the split: 2x V100 86.7 against ~74 tok/s), else the split - the first card on
+    """Two cards (maya-ik2 --gpus 2: NVIDIA, or AMD's split on Linux): the first alone where it holds every expert
+    (the resident path - faster there than the split: 2x V100 86.7 against ~74 tok/s), else the split - the first on
     the offload path (the dense weights, the cache, every prompt, its tier), the second with the next experts, the
     rest in pinned RAM.  plan()'s keys plus "gpus" (1 or 2), "layout" "resident" / "split" (every expert on the two
     cards) / "split+ram", "gpu1_gib" (the second card's experts).  "ram_gib" as one card's offload path: the prompts
@@ -173,11 +175,11 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
     """Why drafting is off on this card (one line), or None.  Every NVIDIA class the engine runs on drafts - Volta
     and Turing (sm_70 / sm_75) have their own verify-window kernels since v1.1.75.  The offload path (the card does
     not hold every expert: a small card, or a long context) drafts where its whole cache stays in VRAM and the experts'
-    tier has the drafter's room, on AMD and NVIDIA alike, and on two NVIDIA cards (gpus2: the split, plan_two's "gpus"
-    2 - its cache is whole in VRAM): --drafting auto measures it once on the PC (on NVIDIA against plain decoding in
-    the PC's own mode - lane parity where that is faster - and keeps the faster, the same at every start; on a V100
-    it may well keep plain decoding).  With every expert in VRAM it is kept (an AMD APU always).  A VRAM not known
-    counts as not a reason; arch is no reason any more (kept for the callers)."""
+    tier has the drafter's room, on AMD and NVIDIA alike, and on two cards (gpus2: the split, plan_two's "gpus"
+    2 - its cache is whole in VRAM, on AMD too): --drafting auto measures it once on the PC (on NVIDIA against plain
+    decoding in the PC's own mode - lane parity where that is faster - and keeps the faster, the same at every start;
+    on a V100 it may well keep plain decoding).  With every expert in VRAM it is kept (an AMD APU always).  A VRAM not
+    known counts as not a reason; arch is no reason any more (kept for the callers)."""
     off_cache = ("drafting off: at this context part of the cache streams from RAM, where drafting does not run - a "
                  "smaller context or a bigger card brings it back")
     off_room = ("drafting off: at this context the experts' tier has no room for the drafter - a smaller context or a "
@@ -185,6 +187,8 @@ def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hi
     if hip:
         if apu or not vram_gb or plan(vram_gb, ctx, kv)["resident"]:
             return None
+        if gpus2:           # (the two-card split: its cache whole in VRAM, as on NVIDIA)
+            return None if draft_fits(vram_gb, ctx, kv) else off_room
         if plan(vram_gb, ctx, kv)["kv_streamed"]:
             return off_cache
         return None if draft_fits(vram_gb, ctx, kv) else off_room
@@ -206,29 +210,43 @@ def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
     return max(fits) if fits else CONTEXTS[0]
 
 
+def recommended_context_two(vram0_gb: float, vram1_gb: float, kv: str = DEFAULT_KV) -> int:
+    """recommended_context() for two cards: the largest of CONTEXTS whose split keeps every expert in VRAM across
+    them (plan_two's "split"), else the first card's own recommendation."""
+    fits = [c for c in CONTEXTS if c <= RECOMMEND_MAX
+            and plan_two(vram0_gb, vram1_gb, c, kv)["layout"] == "split"]
+    return max(fits) if fits else recommended_context(vram0_gb, kv)
+
+
 def amd_unsupported(cards: list, ram_gb: float = 0.0) -> str | None:
-    """The AMD half of unsupported(): maya-ik2's HIP build (Linux) runs on RDNA 3 / 3.5 / 4 (gfx11 / gfx12: its prompt
-    kernels are the matrix cores') - a card of 12 GB or more (under 24 GB the offload path: the experts it does not
-    hold in RAM, as on NVIDIA), or an APU whose memory is the RAM with every expert in it ("unified_memory": its
-    "memory_gb", what the engine may take of it).  cards: {"arch": "gfx1151", "vram_gb", ...}; ram_gb: the PC's RAM
-    (0: not read yet)."""
+    """The AMD half of unsupported(): maya-ik2's HIP build (Linux) runs on RDNA cards - RDNA 1 / 2 (gfx10: the
+    portable kernels, no matrix cores) and RDNA 3 / 3.5 / 4 (gfx11 / gfx12: the matrix-core prompt paths) - one card
+    of 12 GB or more (under 24 GB the offload path: the experts it does not hold in RAM, as on NVIDIA), or an APU
+    whose memory is the RAM with every expert in it ("unified_memory": its "memory_gb", what the engine may take of
+    it).  Two cards (the split, each of 12 GB or more): the first on the offload path, the second with the experts it
+    does not hold; the first's figures are the ones checked for the RAM.  cards: {"arch": "gfx1151", "vram_gb", ...}
+    in the order the engine runs them (GPU 0 first); ram_gb: the PC's RAM (0: not read yet)."""
     if not cards:
         return None
     rdna = [g for g in cards if str(g.get("arch") or "").startswith(AMD_ARCHS)]
-    if not rdna:
-        return ("Inkling 2 Mini on AMD needs a Radeon RX 7000 / 9000, a Radeon PRO W7000 / AI PRO R9700 or a Ryzen AI "
-                "Max (Strix / Gorgon Halo) GPU - RDNA 3, 3.5 or 4 (gfx11 / gfx12); older AMD GPUs are not supported "
-                "by its engine")
+    if len(rdna) < len(cards):
+        return ("Inkling 2 Mini on AMD needs RDNA GPUs (a Radeon RX 5000 / 6000 / 7000 / 9000, a Radeon PRO W6000 / "
+                "W7000 / AI PRO R9700, or a Ryzen AI Max (Strix / Gorgon Halo) APU) - the older GCN cards are not "
+                "supported by its engine")
     apus = [g for g in rdna if g.get("unified_memory")]
-    if apus and max(float(g.get("memory_gb") or 0) for g in apus) >= AMD_APU_MIN_GB:
-        return None
     cards_ = [g for g in rdna if not g.get("unified_memory")]
-    vram = max([float(g.get("vram_gb") or 0) for g in cards_] or [0.0])
-    if vram < AMD_MIN_VRAM_GB:
-        return ("Inkling 2 Mini needs one AMD GPU with 12 GB of VRAM or more, or a Ryzen AI Max APU with 24 GB of "
+    if not cards_:   # (an APU alone: its shared memory is the only room there is - every expert in it, or refused)
+        if apus and max(float(g.get("memory_gb") or 0) for g in apus) >= AMD_APU_MIN_GB:
+            return None
+        return ("Inkling 2 Mini needs an AMD GPU with 12 GB of VRAM or more, or a Ryzen AI Max APU with 24 GB of "
                 "memory free for it")
-    if ram_gb and vram - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb < plan(vram, CONTEXTS[0])["ram_gib"]:
-        return too_small_line(ram_gb, vram)
+    vram0 = float(cards_[0].get("vram_gb") or 0)
+    if any(float(g.get("vram_gb") or 0) < AMD_MIN_VRAM_GB for g in cards_):
+        return ("Inkling 2 Mini needs an AMD GPU with 12 GB of VRAM or more" +
+                (" on each of the cards it runs on" if len(cards_) > 1 else "") +
+                ", or a Ryzen AI Max APU with 24 GB of memory free for it")
+    if ram_gb and vram0 - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb < plan(vram0, CONTEXTS[0])["ram_gib"]:
+        return too_small_line(ram_gb, vram0)
     return None
 
 
@@ -279,8 +297,9 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
         if windows:
             return ("Inkling 2 Mini on AMD runs on Linux only for now (its engine is not built for AMD on Windows "
                     "yet)")
-        if gpus_asked > 1:
-            return "Inkling 2 Mini on AMD runs on one GPU for now: pick one (--gpu N)"
+        if gpus_asked > 2:
+            return ("Inkling 2 Mini on AMD runs on one or two GPUs for now (three or more are not in it yet): pick "
+                    "one or two (--gpu N, --gpus N,M)")
         return amd_unsupported(cards, ram_gb)
     # (NVIDIA: Linux and Windows alike, the same card rules; two cards on Linux only - untested on Windows)
     if windows and gpus_asked > 1:

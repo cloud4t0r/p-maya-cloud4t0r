@@ -5779,8 +5779,12 @@ void check_preview(int n_gpu, bool serve) {
     if (n_gpu == 2 && old_two && !force)
         refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
                "the two-GPU split)" + run_anyway);
-#ifdef MAYA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
-    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
+#ifdef MAYA_USE_HIP   // (two AMD GPUs: the split - GPU 0 on the offload path with every prompt, GPU 1 the experts
+                      //  it does not hold; each card's kernels its own build's, so a mixed pair runs too.  Not
+                      //  validated on AMD yet - a NOTE, not a refusal)
+    if (n_gpu == 2)
+        std::printf("NOTE maya-ik2: --gpus 2 on AMD: the two-GPU split (GPU 0 holds the dense weights, the cache and "
+                    "every prompt; GPU 1 the experts GPU 0 does not) - experimental, not validated on AMD yet\n");
 #endif
     if (n_gpu == 2 && nd < 2)
         refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
@@ -5796,8 +5800,14 @@ void check_preview(int n_gpu, bool serve) {
         if ((std::string(",") + MAYA_HIP_ARCHS + ",").find("," + arch + ",") == std::string::npos)
             refuse("this build has no kernels for " + gpu + ": it is built for " + MAYA_HIP_ARCHS +
                    " (add " + arch + " to CMAKE_HIP_ARCHITECTURES and rebuild)");
-        if (arch.rfind("gfx11", 0) != 0 && arch.rfind("gfx12", 0) != 0 && !force)   // (the matrix-core prompt paths)
-            refuse(gpu + ": maya-ik2 on AMD needs an RDNA 3 / 3.5 / 4 GPU (gfx11 / gfx12)" + run_anyway);
+        // (the matrix cores are RDNA 3 / 3.5 / 4's: an RDNA 1 / 2 card runs the portable kernels - the generic prompt
+        //  attention and the scalar expert path.  The build's arch list above is what decides whether the card has
+        //  kernels at all)
+        if (arch.rfind("gfx10", 0) != 0 && arch.rfind("gfx11", 0) != 0 && arch.rfind("gfx12", 0) != 0 && !force)
+            refuse(gpu + ": maya-ik2 on AMD needs an RDNA GPU (gfx10 / gfx11 / gfx12)" + run_anyway);
+        if (arch.rfind("gfx10", 0) == 0)   // (RDNA 1 / 2: no matrix cores)
+            std::printf("NOTE maya-ik2: %s: RDNA 1 / 2 - the portable kernels (no matrix cores: the prompt attention "
+                        "and the experts take the generic kernels)\n", gpu.c_str());
 #else
         const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", sm_" + std::to_string(p.major) +
                                 std::to_string(p.minor) + ")";

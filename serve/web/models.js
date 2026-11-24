@@ -554,23 +554,30 @@ function qwenFields(m, d, s, ch, gpus) {
 
 // Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
 // Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
-// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card; drafting auto / DSpark / off
+// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card(s) - two cards: the split
+// (the first holds the dense weights, the cache and every prompt, the second the experts it does not); drafting auto /
+// DSpark / off
 function ik2Fields(m, d, ch) {
   const kvb = (m.ik2_kv_bytes || {})[d.kv] || 16384;
   const fit = ((m.ik2_fit || {})[d.kv] || {})[String(d.context)];
-  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: NVIDIA 8 GB or more, AMD 12 GB or more (experts that do not fit stay in RAM), a Ryzen AI Max APU with 24 GB."
-    below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPU">${(MS.data.gpus || []).map((g) => {
-      const on = d.gpus.length === 1 && d.gpus[0] === g.index;
-      return html`<button type="button" role="radio" aria-checked=${String(on)} class="mdl-gpu" onClick=${() => setDraft({gpus: [g.index]})}>
+  const two = !!fit && fit.gpus === 2;
+  const fitLine = !fit ? null
+    : two && fit.layout === "split" ?
+      `At this size every expert stays in VRAM across the two cards (about ${fmt(fit.tier_gib)} GB on the first, ${fmt(fit.gpu1_gib)} GB on the second): the whole cache stays on the first card, so the speed holds deep into a chat.` :
+    two ? `At this size about ${fmt(fit.tier_gib)} GB of the experts stay on the first card and ${fmt(fit.gpu1_gib)} GB on the second, the rest pinned in RAM - slower than with every expert in VRAM. A smaller context keeps them all in VRAM.`
+    : !fit.resident ? `At this size the model and its cache do not all fit on the card: about ${fmt(fit.tier_gib)} GB of the experts stay on it, the others in RAM (the offload path), and ` +
+      (fit.kv_streamed ? `about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM too (KV streaming) - slower the deeper a chat goes.` : "the whole cache stays on the card, so the speed holds deep into a chat.")
+    : fit.kv_streamed ? `At this size about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming): every expert stays on the card, but each token reads that part over the bus - slower the deeper a chat goes. The same answers.` : null;
+  const gpu = html`<${Row} label="GPUs" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU or two: NVIDIA 8 GB or more, AMD RDNA 12 GB or more (experts that do not fit stay in RAM, two cards run the split); a Ryzen AI Max APU with 24 GB."
+    below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPUs">${(MS.data.gpus || []).map((g) => {
+      const on = d.gpus.includes(g.index);
+      return html`<button type="button" role="radio" aria-checked=${String(on)} class="mdl-gpu" onClick=${() => { if (on && d.gpus.length === 1) return; setDraft({gpus: on ? d.gpus.filter((x) => x !== g.index) : [...d.gpus, g.index].sort((a, b) => a - b)}); }}>
         <span class="mdl-gpu__box">${on ? html`<${Icon} name="check" sm/>` : null}</span>
         <span><b>GPU ${g.index}</b><span>${[shortGpu(g.name), g.vram_gb ? `${fmt(g.vram_gb)} GB` : null].filter(Boolean).join(" · ") || "on this PC"}</span></span></button>`;
     })}</div>`}/>`;
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: kvb}, ["kv"],
-        fit && !fit.resident ? `At this size the model and its cache do not all fit on the card: about ${fmt(fit.tier_gib)} GB of the experts stay on it, the others in RAM (the offload path), and ` +
-          (fit.kv_streamed ? `about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM too (KV streaming) - slower the deeper a chat goes.` : "the whole cache stays on the card, so the speed holds deep into a chat.")
-        : fit && fit.kv_streamed ? `At this size about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming): every expert stays on the card, but each token reads that part over the bus - slower the deeper a chat goes. The same answers.` : null),
+      contextRow(m, d, ch, {vram: kvb}, ["kv"], fitLine),
       html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", dspark: "on"}[d.draft] || "off")} changed=${ch("draft")}
         hint=${(m.choices.draft.includes("dspark") ? "The model's own drafter (DSpark) and the prompt lookup draft tokens the model checks: the same answers, faster where the drafts are kept (code, edits). " :
           "The prompt lookup drafts tokens the model checks (copied text): the same answers. ") +

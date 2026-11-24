@@ -433,6 +433,13 @@ class Settings(unittest.TestCase):
         self.assertEqual(m["ik2_fit"]["f16"]["262144"]["layout"], "offload")    # (the experts leave the card first,
         self.assertFalse(m["ik2_fit"]["fp8"]["1048576"]["kv_streamed"])         #  the whole cache stays in VRAM)
         self.assertGreaterEqual(m["size"], 1000)                               # (the GGUF)
+        # (two cards: the page's fit is the split's - the first card's tier and the experts the second holds)
+        two = self.ik2_cfg(gpu=[0, 1])
+        with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RX 6800", "vram_gb": 16.0},
+                                                                {"index": 1, "name": "RX 9070", "vram_gb": 16.0}]):
+            m2 = M.describe(two, None)
+        self.assertEqual({k: v for k, v in m2["ik2_fit"]["fp8"]["262144"].items() if k in ("gpus", "layout")},
+                         {"gpus": 2, "layout": "split"})
         plan = M.delete_plan(self.d, self.d / "maya-inkling-2-mini.json")
         self.assertTrue(plan["ok"], plan.get("why"))
         self.assertEqual(Path(plan["folder"]).name, "Inkling-2-Mini")
