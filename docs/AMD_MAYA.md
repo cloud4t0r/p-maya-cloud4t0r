@@ -48,7 +48,11 @@ RDNA 2 (`gfx1030`: RX 6800 / 6800 XT / 6900 XT / 6950 XT, Radeon PRO V620 / W680
 it has been run on a Radeon PRO V620 with ROCm 7 - please report how it goes on other RDNA 2 cards in an issue. These
 cards have no matrix cores (WMMA), so the engine uses its portable kernels there (the prompt attention on the F32
 kernel), and a build for RDNA 2 cards alone needs no rocWMMA headers (ROCm 7 no longer ships them). The ROCm
-installation needs its library kernels (hipBLAS) for `gfx1030`.
+installation needs its library kernels (hipBLAS) for `gfx1030`. The prompt path runs its sub-batches 64 tokens at a
+time on these cards: a prompt GEMM whose sub-batch passes 64 tokens comes back wrong there, so a longer one fed the
+router non-finite values (`SETTINGS.md`, `MAYA_GLM_PREFILL_SUB`; measured on an RX 6800 with ROCm 7 - the RX 9070
+beside it is unaffected). hipBLAS itself is exact on those shapes there: a foreign write lands in the GEMM's output
+buffer while it fills it, which the shorter sub-batch keeps out of the window.
 
 Configs are named `maya-<quant>-hip.json` and
 select the AMD device through `HIP_VISIBLE_DEVICES`.
