@@ -197,6 +197,11 @@ function closeEditor() {
 // the draft as the server takes it: "" -> the default (null), a number typed -> a number
 const NUMS = ["context", "parallel", "reserve_mib", "expert_cache", "prefill", "kv_resident", "tp", "prefill_chunk", "cpu_threads"];
 const DECS = ["reserve_gb", "cache_gb", "dspark_conf"];   // (a decimal: 0.7, 1.5)
+// a number field that is not a number (tp also takes "auto", Hy4-Flash's default: the server writes no flag for it)
+function badField(k, v) {
+  if (k === "tp" && v === "auto") return false;
+  return (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v));
+}
 function toSend(d) {
   const out = {...d};
   for (const k of [...NUMS, ...DECS]) {
@@ -552,7 +557,7 @@ function qwenFields(m, d, s, ch, gpus) {
   ];
 }
 
-// Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
+// Inkling-2-Mini's (maya-ik2: it stops at a flag it does not know, so only its own are offered).
 // Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
 // setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card(s) - two cards: the split
 // (the first holds the dense weights, the cache and every prompt, the second the experts it does not); drafting auto /
@@ -681,7 +686,7 @@ function Editor({m}) {
   const keys = Object.keys(s);
   const changed = keys.filter((k) => !same(sent[k], s[k]));
   const envChanged = !same(sent.env, s.env);
-  const bad = Object.entries(d).some(([k, v]) => (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v)));
+  const bad = Object.entries(d).some(([k, v]) => badField(k, v));
   const canSave = changed.length > 0 && !bad && !MS.check && !MS.saving && !MS.restart;
   const restarts = m.running && MS.data.restarts;
   // (the running model's context size alone, on a server that reloads it in place: Settings' reload, not a restart)

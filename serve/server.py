@@ -24,6 +24,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import contextlib
 import dataclasses
@@ -39,6 +40,7 @@ import os
 import queue
 import socket
 import re
+import shutil
 import subprocess
 import struct
 import sys
@@ -48,6 +50,7 @@ import time
 import traceback
 import urllib.request
 import uuid
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -155,7 +158,8 @@ def hy4_tool_pictures_noted(messages: list) -> list:
         out.append(m)
     return out
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, check_messages, config_effort,
+                            deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -601,6 +605,7 @@ NONFINITE = "non-finite"
 
 # what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
 LOOP_STOP = object()
+SEGMENT = object()          # separates one engine call's tokens from the next's in segments() (run's drain)
 # ... and the answer it gets when that happens before any answer text (never a silent end after the thinking)
 LOOP_STOP_NOTE = "(The answer was stopped: the model kept repeating itself.)"
 # a request's max_tokens lowers the thinking budget only at or below this (Service.run)
@@ -625,6 +630,10 @@ THINK_RESTARTS = 2
 THINK_NOTE = ("[The server's note, not the user: your thinking was cut off there - an end-of-turn marker written "
               "inside the thinking is a quote, not the turn's end. Do not stop: go on with the thinking, right where "
               "it stopped.]")
+# A model whose thinking ends the turn even after the restarts above leaves nothing for the answer; the turn goes out
+# with a reasoning block and no content at all, which an agent client retries as an empty answer.  As the loop guard
+# does (LOOP_STOP_NOTE), the turn says so in one line instead of ending empty.
+THINK_STOP_NOTE = "(The answer was stopped: the model's thinking ended the turn without an answer.)"
 _THINK_BOUNDARY = re.compile(r"(?:\n|(?<![\d.])[.!?][\"')\]]*|[。！？])[ \t]*$")
 
 
@@ -654,6 +663,16 @@ def think_stop_tables(tok) -> str:
             stop.append(t)
     j = lambda v: ",".join(map(str, v))
     return f" think_stop={j(stop)} think_weak={j(weak)} think_dig={j(dig)}" if stop or weak else ""
+
+
+def openings_left(starts: list[list[int]], written: list[int]) -> list[list[int]] | None:
+    """GEN's starts= (the answer opens with one of these sequences: Service.prepare) for a later engine call of the
+    same answer, after its tokens `written`: what the sequences it still matches have left - None once one is written
+    whole, or none matches."""
+    n = len(written)
+    if any(q == written[:len(q)] for q in starts):
+        return None
+    return [q[n:] for q in starts if q[:n] == written and len(q) > n] or None
 
 
 def think_boundary(text: str) -> bool:
@@ -1115,6 +1134,7 @@ class StrataEngine:
             models.hy4_note_before_start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        track_spawned(self.proc)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
@@ -1480,6 +1500,11 @@ class StrataEngine:
         tb, te = sampling.get("_think_budget"), sampling.get("_think_end")   # the run config's (StrataService.run)
         think = f" think_budget={tb} think_end={te}" if isinstance(tb, int) and isinstance(te, int) and tb > 0 and \
             te >= 0 else ""
+        ink = sampling.get("_think_ink")      # (Inkling 2: its segment's close, ik2's GEN think_*)
+        if isinstance(ink, dict):
+            think = (f" think_open={ink['open']} think_end={ink['end']} think_soft={ink['soft']} think_hard={ink['hard']}"
+                     f" think_after=" + ";".join(",".join(str(int(i)) for i in q) for q in ink["after"]) +
+                     (ink.get("stops") or ""))
         soft, stops = sampling.get("_think_soft"), sampling.get("_think_stops")
         if think and isinstance(soft, int) and soft > 0 and isinstance(stops, str) and stops:
             think += f" think_soft={soft}{stops}"   # (#746: the engine closes at the sentence's end, a prefix of the state)
@@ -1518,6 +1543,9 @@ class StrataEngine:
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
+        starts = sampling.get("_starts")      # (Service.prepare: the answer opens with one of these)
+        if starts:
+            bias_key += " starts=" + ";".join(",".join(str(int(i)) for i in q) for q in starts)
         penalty_keys = StrataEngine.penalty_keys(sampling)
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
@@ -2007,6 +2035,55 @@ class StrataEngine:
             self.proc.kill()
 
 
+PICTURE_DIR_PREFIXES = ("maya-vision-", "maya-ds4-pictures-", "maya-hy4-pictures-", "maya-mm3-pictures-")
+PICTURE_DIR_PID = ".maya-pid"       # the server that owns the folder (a second server running at once keeps its own)
+
+
+def picture_dir(prefix: str) -> Path:
+    """A folder in the temp directory for the pictures a server reads (cached by hash while it runs).  It goes when the
+    server ends (any way out of main(); #1180) - on tmpfs these folders were RAM that was never given back."""
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    with contextlib.suppress(OSError):
+        (d / PICTURE_DIR_PID).write_text(str(os.getpid()), encoding="ascii")
+    atexit.register(shutil.rmtree, str(d), True)
+    return d
+
+
+def clean_stale_picture_dirs(older_than: float = 86400.0, temp: str | None = None, now: float | None = None) -> int:
+    """At start: the picture folders of earlier runs that ended without removing theirs (kill -9, a power cut): only
+    ours (the prefixes above), only in the temp directory, only when older than a day and their server is gone.  The
+    number removed."""
+    root = Path(temp or tempfile.gettempdir())
+    now = time.time() if now is None else now
+    n = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for d in entries:
+        try:
+            if not d.name.startswith(PICTURE_DIR_PREFIXES) or d.is_symlink() or not d.is_dir():
+                continue
+            if now - d.stat().st_mtime < older_than:
+                continue
+            try:
+                pid = int((d / PICTURE_DIR_PID).read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                pid = 0
+            if pid and pid != os.getpid():
+                try:
+                    import psutil
+                    if psutil.pid_exists(pid):
+                        continue                         # (its server still runs)
+                except ImportError:
+                    pass
+            shutil.rmtree(d, ignore_errors=True)
+            n += not d.exists()
+        except OSError:
+            continue
+    return n
+
+
 class Vision:
     """The resident image encoder: `maya-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     and `VID <video> <out>` lines and writes each picture's embeddings (a video: one record per frame); results
@@ -2031,7 +2108,7 @@ class Vision:
         if cfg.get("no_flash_attn"):   # GLM-5.3's encoder on a GPU: full-precision attention (cosine 0.9997 vs 0.999)
             args.append("--no-flash-attn")
         self.args, self.log, self.env = args, log, env
-        self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
+        self.dir = picture_dir("maya-vision-")
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
         # on demand without lending (Inkling 2: maya-ik2 lends no memory): a callable, True when the GPU's free memory
@@ -2063,6 +2140,7 @@ class Vision:
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
                                          bufsize=1, env=env)
+            track_spawned(self.proc)
             line = self.proc.stdout.readline()
             if not line.startswith("READY"):
                 raise RuntimeError("the vision encoder did not start: " + line.strip())
@@ -2158,7 +2236,9 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
-                return self.cache[key]
+                if self.cache[key][0].is_file():
+                    return self.cache[key]
+                del self.cache[key]
             if self.proc is None:
                 self._start()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -2213,7 +2293,9 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
-                return self.cache[key]
+                if self.cache[key][0].is_file():
+                    return self.cache[key]
+                del self.cache[key]
             vid, out = self.dir / f"{key}.vid", self.dir / f"{key}.sve"
             vid.write_bytes(data)
             # a long video is many frames (every one an image's tokens): refused before it is decoded
@@ -2249,14 +2331,14 @@ class Vision:
             return self.cache[key]
 
     def close(self):
-        if self.proc is None:
-            return
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+        if self.proc is not None:
+            try:
+                self.proc.stdin.write("QUIT\n")
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=10)
+            except Exception:
+                self.proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)    # (#1180: the pictures it kept go with the server)
 
 
 def gpu_free_bytes(gpu: int) -> int | None:
@@ -2297,6 +2379,37 @@ def amd_gpu_free_bytes(gpu: int, sysfs: str | None = None, meminfo: str = "/proc
         except (OSError, ValueError, KeyError):
             return None
     return total - used if total is not None and used is not None else None
+
+
+def vision_plan(cfg: dict, env: dict, cache_file: Path):
+    """(vision config, the encoder's environment, on demand?, footprint, the ENGINE's environment) for a config with
+    pictures.  The one place the engine's environment gets its picture-related keys (the GLM engine's lend size; the
+    server and the bench both start the engine from it).  maya-ik2 lends no memory and plans none for pictures: its
+    start - context, cache, drafter - is the same with pictures on or off; the encoder takes what is free when a
+    picture arrives, else the CPU."""
+    vcfg = cfg.get("vision") or None
+    venv = dict(env)
+    if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
+        venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+    # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
+    # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
+    # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
+    on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
+    engine_env, fp = env, None
+    if on_demand:
+        fp = vision_footprint(vcfg, venv, cache_file, (gpu_list(cfg) or [0])[0])
+        if fp is None:
+            vcfg, on_demand = dict(vcfg, gpu=False), False
+        else:
+            vcfg = dict(vcfg, max_tokens=fp[0])
+            if models.family(cfg) != "ik2":
+                engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+    return vcfg, venv, bool(on_demand), fp, engine_env
+
+
+def engine_environment(cfg: dict, cache_file: Path) -> dict:
+    """The environment the engine is started with for this config: child_env plus the picture keys."""
+    return vision_plan(cfg, child_env(cfg), cache_file)[4]
 
 
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
@@ -2494,8 +2607,9 @@ def child_env(cfg: dict) -> dict:
     # lane kernels (maya --speed-calibration measures again)
     # GLM's CPU lane: its timing (an expert on the CPU vs over PCIe), which plans the split of RAM-tier experts between
     # the CPU and the GPU, timed at the first start on this PC and kept - re-timed at every start it moved experts
-    # between the two (other bits) and so the same request's greedy answer from start to start (the engine re-times
-    # by itself when decode drifts from it for 5 requests in a row; a new build has its own entry)
+    # between the two (other bits) and so the same request's greedy answer from start to start.  The entry is the
+    # PC's (its CPU, the model, the card and the lane's threads), not a build's: an update keeps it, and with it the
+    # answers; maya --speed-calibration times again and replaces it only when the new timing is clearly faster
     if models.family(cfg) == "glm":
         env.setdefault("MAYA_GLM_CPU_CAL", str(GLM_CPU_CAL_FILE))
     if models.family(cfg) == "hy4":
@@ -2962,6 +3076,16 @@ class Service:
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # Inkling 2 writes no think tags: its reasoning is a typed segment, <|content_thinking|> ... <|end_message|>,
+        # and its answer the next message's <|message_model|><|content_text|> (or a call).  Its thinking budget closes
+        # a segment with think_close_ids (the segment's end and the next message's opening); the engine does it
+        # (maya-ik2's GEN think_*: its decode forces the close, no stop and restart) - think_end_id stays None
+        self.think_open_id, self.think_close_ids, self.think_text_id = None, [], None
+        if getattr(template, "inkling", False):
+            op, em, mm, tx = (_special_ids(s) for s in ("<|content_thinking|>", "<|end_message|>", "<|message_model|>",
+                                                       "<|content_text|>"))
+            if op and em and mm and tx:
+                self.think_open_id, self.think_close_ids, self.think_text_id = op[0], [em[0], mm[0]], tx[0]
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
         # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
@@ -3325,12 +3449,18 @@ class Service:
             return glm_dsa_product.LABEL
         return None
 
+    @property
+    def has_think_budget(self) -> bool:
+        """The model closes its thinking with a token of its own (</think>) or, Inkling 2, with a segment's end."""
+        return self.think_end_id is not None or (bool(getattr(self, "think_close_ids", None)) and
+                                                 (getattr(self.engine, "info", None) or {}).get("think") == 1)
+
     def think_budget_info(self) -> dict:
         """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all; and
         GLM-5.3's for a request that asks for Max itself while the budget is the default ("max_level":
         think_budget_max, the most it gets - absent for every other model)."""
         top = getattr(self, "think_budget_max", 0)
-        return {"budget": int(self.think_budget or 0), "supported": self.think_end_id is not None,
+        return {"budget": int(self.think_budget or 0), "supported": self.has_think_budget,
                 "saved": bool(self.config_path), **({"max_level": top} if top else {})}
 
     @staticmethod
@@ -3345,7 +3475,7 @@ class Service:
         """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
         read per request, no restart) and is saved into the run config - marked as the user's own, so a setup or a
         switch keeps it."""
-        if self.think_end_id is None:
+        if not self.has_think_budget:
             raise ValueError("this model has no thinking budget")
         n = maya_quants.check_thinking_budget(value)
         self.think_budget = n
@@ -4020,6 +4150,27 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def _call_openings(self, tools) -> list[list[int]] | None:
+        """Inkling 2, a call to any tool: each tool's name and the call's segment as the model writes them after
+        <|message_model|> (GEN's starts=, the engine's choice among them); None where the engine does not read it."""
+        if (getattr(self.engine, "info", None) or {}).get("starts") != 1:
+            return None
+        seg = (getattr(self.tok, "special_tokens", None) or {}).get("<|content_invoke_tool_json|>")
+        names = [t.get("name") for t in tools or [] if isinstance(t, dict) and t.get("name")]
+        if seg is None or not names:
+            return None
+        return [self.tok.encode(n) + [seg] for n in names]
+
+    def _think_after(self, tools) -> list[list[int]] | None:
+        """Inkling 2, what may follow its thinking when the budget closes it (GEN's starts=, the engine's pick among
+        them): its text segment, or a call to any of the request's tools - so a request with tools is still free to
+        call one.  None with no tools (the text segment follows the close as it is) or where the engine does not read
+        starts= - it too gets the text segment."""
+        if not self.think_close_ids or not tools:
+            return None
+        calls = self._call_openings(tools)
+        return [[self.think_text_id]] + calls if calls else None
+
     def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, guard=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
@@ -4051,7 +4202,7 @@ class Service:
             # default) - and its prompt is rendered at Max: run() may give it the long budget (think_budget_max,
             # asked_max).  It goes to run() with the request, as _think_resume does
             given["_think_max"] = True if own_level == "max" and self.template.think_level(kwargs) == "max" else None
-        prefill = ""
+        prefill, starts = "", None
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
             glm_calls = "<arg_key>" in self.template.source
@@ -4063,6 +4214,11 @@ class Service:
                 # Inkling 2: a call is a model message of its own, <|message_model|>NAME<|content_invoke_tool_json|>
                 # {"name": .., "args": ..}: the prompt opens it; the parser reads it through InklingRewriter
                 prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
+                if not force:
+                    # any tool: the name comes first, so the prompt cannot open "a call" - only the model's message,
+                    # which the model may still go on with in words.  Where the engine reads starts= (maya-ik2), the
+                    # message opens with one of the tools' names and the call's segment, as the model picks
+                    starts = self._call_openings(tools)
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         if not prefill and not tools and getattr(self.template, "inkling", False) and \
@@ -4074,6 +4230,8 @@ class Service:
             kwargs = {**kwargs, "enable_thinking": False}
             prefill = "<|message_model|><|content_text|>"
         given["_prefill"] = prefill
+        given["_starts"] = starts
+        given["_think_after"] = self._think_after(tools) if not prefill else None
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
             # the opening as its template writes it; the parser reads it in GLM's spelling, as it reads the answer
@@ -4169,12 +4327,26 @@ class Service:
                 self.engine_for("has pictures")          # (two GPUs: pictures are read on the AMD GPU alone)
                 with self.vision.active():
                     enc = []
-                    for kind, src in media:
-                        if cancel is not None and cancel.is_set():
-                            raise ValueError("image preparation was cancelled")
-                        enc.append((kind, self.vision.encode(src) if kind == "image"
-                                    else self.vision.encode_video(src)))
+                    combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+                    try:
+                        with open(combined, "wb") as target:
+                            for kind, src in media:
+                                if cancel is not None and cancel.is_set():
+                                    raise ValueError("image preparation was cancelled")
+                                item = self.vision.encode(src) if kind == "image" else self.vision.encode_video(src)
+                                enc.append((kind, item))
+                                # Own the bytes before the next encode can evict this cache entry. active()
+                                # holds the encoder lock, so another preparation cannot evict it mid-copy.
+                                with open(item[0], "rb") as source:
+                                    shutil.copyfileobj(source, target)
+                    except OSError as e:
+                        combined.unlink(missing_ok=True)
+                        raise BadBody(503, "vision embeddings could not be prepared. Retry the request.") from e
+                    except BaseException:
+                        combined.unlink(missing_ok=True)
+                        raise
                 if cancel is not None and cancel.is_set():
+                    combined.unlink(missing_ok=True)
                     raise ValueError("image preparation was cancelled")
             literal = self.tok.encode(image_pad, parse_special=False)
             encoded = [e for kind, e in enc if kind == "image"]
@@ -4191,6 +4363,7 @@ class Service:
                 else:
                     out.append(t)
             if k != len(encoded):
+                combined.unlink(missing_ok=True)
                 raise ValueError("the prompt and its images do not match")
             ids = out
             # each <|video|> marker -> its frames, every frame an independent image wrapped in the image's own
@@ -4209,12 +4382,9 @@ class Service:
                     else:
                         out.append(t)
                 if k != len(videos):
+                    combined.unlink(missing_ok=True)
                     raise ValueError("the prompt and its videos do not match")
                 ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for _, (path, _) in enc:
-                    f.write(path.read_bytes())
             self.embeddings.path = combined
         if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
             raise BadBody(503, "the model is starting; try again in a moment")
@@ -4397,6 +4567,22 @@ class Service:
         finally:
             if not hold[0]:
                 self.fifo.leave(place)
+
+    @staticmethod
+    def lowered_think_budget(budget: int, max_new, forced: int = 1) -> tuple[int, int | None]:
+        """-> (budget, soft) for a request whose output limit is `max_new` (None or 0: none): `forced` tokens of the
+        close count toward that limit (</think>: 1; Inkling 2's segment end, message opening and text segment: 3).  A
+        limit of THINK_TINY_LIMIT or less lowers the budget (a side request such as a title must still get an answer:
+        a reserve is kept for it); a larger one is the client's cap on the whole output and leaves it.  Otherwise
+        `soft` is the budget at which the reasoning is closed at its next sentence or line end, and `budget` the hard
+        one THINK_GRACE tokens later (at most half the room the limit leaves after it; no room: no soft, #613)."""
+        if max_new and int(max_new) <= THINK_TINY_LIMIT:
+            reserve_floor = max(0, int(os.environ.get("MAYA_GLM_THINK_RESERVE", "1024") or 1024))
+            reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
+            return max(1, min(budget, int(max_new) - reserve - forced)), None
+        room = (int(max_new) - budget - forced) // 2 if max_new else THINK_GRACE
+        grace = max(0, min(THINK_GRACE, room))
+        return (budget + grace, budget) if grace > 0 else (budget, None)
 
     @staticmethod
     def _resumed_sampling(sampling, produced):
@@ -4657,6 +4843,7 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
+        starts0 = (sampling or {}).get("_starts")       # (the answer's opening, Service.prepare: its first call's)
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
@@ -4667,6 +4854,8 @@ class Service:
         tail_text = ""
         while True:
             last0 = getattr(self.engine, "last", None)
+            if produced and starts0:   # (a later call - a fair slice, a restart - goes on after the opening)
+                smp = {**(smp or {}), "_starts": openings_left(starts0, produced)}
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
@@ -4839,6 +5028,7 @@ class Service:
         think_resume = (sampling or {}).get("_think_resume")   # (ids, thinks): a quoted marker inside the thinking
         think_restarts = 0                          # times the thinking was resumed in this answer
         said = []                                   # this engine call's text for the user (stops_short)
+        reason_said = []                            # its reasoning's text (a call the model wrote in it, salvaged below)
         join = None                                 # after a keep: the paragraph break before the continuation (#921)
         kept = 0                                    # times it was kept going in this answer
         called = False                              # it wrote a tool call (then its turn does not end here)
@@ -4925,6 +5115,10 @@ class Service:
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
                 budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
+                # Inkling 2 (no think tags): the server closes a thinking segment itself (_sliced: think_close_ids)
+                ink_think = bool(thinking) and bool(self.think_close_ids) and self.think_budget > 0 and \
+                    (getattr(self.engine, "info", None) or {}).get("think") == 1
+                budgeted = budgeted or ink_think
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
@@ -4941,18 +5135,23 @@ class Service:
                 if top > think_budget > 0 and max_new and self.asked_max(sampling):
                     think_budget = min(top, max(think_budget, int(max_new) - THINK_LONG_RESERVE))
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
-                if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
-                    reserve_floor = max(0, int(os.environ.get("MAYA_GLM_THINK_RESERVE", "1024") or 1024))
-                    reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
-                    think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
-                elif budgeted:
-                    # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
-                    # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
-                    room = (int(max_new) - think_budget - 1) // 2 if max_new else THINK_GRACE
-                    grace = max(0, min(THINK_GRACE, room))
-                    if grace > 0:
-                        soft, think_budget = think_budget, think_budget + grace
                 if budgeted:
+                    # Inkling: the forced close is its segment's end, the next message's opening and the text segment
+                    think_budget, soft = self.lowered_think_budget(
+                        think_budget, max_new, len(self.think_close_ids) + 1 if ink_think else 1)
+                if ink_think:
+                    # (the engine closes the segment in its decode, GEN's think_*: StrataEngine.sampling_keys; the
+                    #  forced tokens are the segment's end and the next message's opening, then its pick among `after`:
+                    #  its text segment, or a call to one of the request's tools)
+                    after = (sampling or {}).get("_think_after") or [[self.think_text_id]]
+                    stops = getattr(self, "_think_stops", None)
+                    if stops is None:
+                        stops = self._think_stops = think_stop_tables(self.tok)
+                    sampling = {**{k: v for k, v in (sampling or {}).items() if k != "_think_after"},
+                                "_think_ink": {"soft": soft if soft is not None else think_budget, "hard": think_budget,
+                                               "open": self.think_open_id, "end": self.think_close_ids[0],
+                                               "after": [[self.think_close_ids[1], *q] for q in after], "stops": stops}}
+                elif budgeted:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
                     if soft is not None:
                         sampling["_think_soft"] = soft
@@ -5003,8 +5202,13 @@ class Service:
                     """attempts(), and after a blocked call (seg["next"]) the engine again on that prompt.  That prompt
                     also holds the server's own tokens (the call's result or KEEP_NOTE, a steer), which max_new - n
                     does not count: the context's room caps it too (with an unlimited max_new, prepare's room, the
-                    engine rejected prompt + max_new + CTX_SLACK > context)."""
+                    engine rejected prompt + max_new + CTX_SLACK > context).  SEGMENT separates one call's tokens
+                    from the next's: the thinking restarts' drain stops at it, and the token loop skips it."""
+                    first = True
                     while True:
+                        if not first:
+                            yield SEGMENT               # (a continuation begins: not a token, not a heartbeat)
+                        first = False
                         room = self.engine.max_context - CTX_SLACK - len(seg["prompt"])
                         l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
@@ -5035,6 +5239,7 @@ class Service:
                 guard_on = self._loop_guard_on(sampling)
                 gen = segments()
                 answered = bool(pre_events)             # any answer (text or a call) went out yet
+                said_note = False                       # (a stop that already explains itself: the loop guard's)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -5053,8 +5258,11 @@ class Service:
                                     yield "event", ev
                                 held = ""
                             if not answered:             # (a model with no end-of-thinking token, still thinking)
+                                said_note = True
                                 yield "event", Event("content", LOOP_STOP_NOTE)
                             break
+                        if t is SEGMENT:                # a continuation's first token follows: not the model's
+                            continue
                         n += 1
                         if my_first is None:
                             my_first = time.time()
@@ -5067,8 +5275,12 @@ class Service:
                                       f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
                                       ": closed, answering", flush=True)
                         text, stopped = detok.push(t), False
-                        if end_think and parser.token_only_end:
-                            text = ""            # (the token's own text: the reasoning ends at the token, the tag is no one's text)
+                        if t == self.think_end_id and parser.token_only_end:
+                            # the token's own text: the tag is no one's text.  Not only when it closes the reasoning
+                            # (end_think): a model that closes twice - or the answer's continuation, a reasoning that
+                            # was already closed (see the last restart) - would otherwise put the tag verbatim into
+                            # the answer's text (measured: 46 turns of 11-23; an 8-char piece each)
+                            text = ""
                         if t in self.stop_ids and parser.state == "reasoning" and not answered and not called \
                                 and not pending:
                             # a marker inside the thinking is the model's own text - it quotes the server's own markers
@@ -5082,13 +5294,43 @@ class Service:
                                 finish = "stop"
                                 break
                             think_restarts += 1
+                            last = think_restarts >= THINK_RESTARTS
                             print(f"[maya] thinking: an end-of-turn marker inside it is a quote - going on with the "
-                                  f"thinking ({think_restarts}. of {THINK_RESTARTS})", flush=True)
+                                  f"{'answer' if last else 'thinking'} ({think_restarts}. of {THINK_RESTARTS})",
+                                  flush=True)
                             ids_k, thinks = think_resume
+                            if last:
+                                # the restarts are spent, and asking the model to think on only made it plan again
+                                # (measured: 565 more tokens of the same, then EOS).  Its thinking is done - it
+                                # wrote the calls it means to make in it - so the reasoning is closed here, at the
+                                # model's own end-of-thinking token put in the prompt, and the turn goes on from a
+                                # thinking that is closed, not one that was cut
+                                for ev in parser.close_reasoning():
+                                    answered = answered or ev.kind != "reasoning"
+                                    yield "event", ev
+                                if thinks and self.think_end_id is not None:
+                                    ids_k = [*ids_k, self.think_end_id]
+                                thinks = False
+                                # the engine restarts the thinking's budget at every call, and this continuation is the
+                                # answer's: a budget firing here would swap a sampled token for the think-end one, whose
+                                # text no one swallows now (a literal </think> in the answer).  The keep path strips
+                                # the same keys for the same reason.
+                                sampling = {k: v for k, v in (sampling or {}).items()
+                                            if k not in ("_think_budget", "_think_soft", "_think_end", "_think_stops")}
                             steer = self.tok.encode(loop_guard.keep_steer(think_restarts)) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
+                            # (reason_said stays: the restarts are one continuous thinking, and a call the model
+                            # wrote in it is what the salvage at the end reads out)
                             parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
                             in_think = thinks and bool(thinking) and self.think_end_id is not None
+                            if last:
+                                # this engine call's tail is the thinking's own (the continuation above re-reads
+                                # it from its prompt): it is dropped - fed to the answer's parser, a stop token in
+                                # it would end the turn before the continuation ever ran.  The drain stops at
+                                # SEGMENT, so what follows is the continuation's own first token.
+                                for t2 in gen:
+                                    if t2 is SEGMENT:
+                                        break
                             continue
                         # a marker the model wrote as its answer's text - quoted, in a code fence, a tool call's body - is
                         # not the turn's end (the stream's own parser has the same rule for calls)
@@ -5115,7 +5357,8 @@ class Service:
                                 steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)
-                                parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
+                                parser, detok, held, said[:], reason_said[:] = \
+                                    new_parser(thinks), Detokenizer(self.tok), "", [], []
                                 in_think = thinks and bool(thinking) and self.think_end_id is not None
                                 continue
                             if key is None:
@@ -5131,7 +5374,7 @@ class Service:
                             steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
                             sampling = loop_guard.block_sampling(sampling, tries[key])
-                            parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                            parser, detok, held, said[:], reason_said[:] = new_parser(), Detokenizer(self.tok), "", [], []
                             in_think = bool(thinking) and self.think_end_id is not None
                             continue
                         seg["ids"].append(t)
@@ -5186,6 +5429,8 @@ class Service:
                                     ev = dataclasses.replace(ev, text=t)
                             if ev.kind == "content":
                                 said.append(ev.text)
+                            elif ev.kind == "reasoning":
+                                reason_said.append(ev.text)
                             elif ev.kind == "tool_call":
                                 called = True
                             if blocked and (pending or ev.kind.startswith("tool")):
@@ -5205,6 +5450,32 @@ class Service:
                         for ev in with_lp(parser.feed(held), was):
                             yield "event", ev
                         held = ""
+                    if finish == "stop" and not answered and not said_note and (reason_said or think_restarts):
+                        # DeepSeek writes the call it means to make in its thinking and can end the turn there: the
+                        # reasoning holds a whole <tool_call>, the answer holds nothing, and an agent client sees a
+                        # turn that did nothing.  A call is read out of what the model wrote there - a fresh parser,
+                        # so nothing goes out twice (this runs only when the turn emitted neither text nor a call;
+                        # reason_said / think_restarts gate it to a thinking that truly happened, so a client's stop
+                        # sequence on an empty answer keeps its old meaning: an empty answer, not this note)
+                        salvaged = False
+                        thought = "".join(reason_said)
+                        if not called and thought.rstrip().endswith(CALL_END):
+                            # only a call the reasoning ENDS with: one it wrote and then went on reasoning past is a
+                            # draft it thought better of (or a quoted example of this server's own syntax), not a call
+                            # it meant to make - and never one the loop guard just blocked (blocked's own key)
+                            last = None
+                            for ev in new_parser(False).feed(thought):
+                                if ev.kind == "tool_call":
+                                    last = ev
+                            if last is not None and (not blocked or (last.call.name, loop_guard.args_key(last.call.arguments)) not in blocked):
+                                called, answered, salvaged = True, True, True
+                                yield "event", last
+                        if not salvaged:
+                            if CALL_START in thought:
+                                print(f"[maya] a tool call written in the thinking was not read out of it"
+                                      f"{' (blocked)' if blocked else ''}: the turn ends with the note", flush=True)
+                            # never end empty: an agent client retries an empty turn (the loop guard says its own line)
+                            yield "event", Event("content", THINK_STOP_NOTE)
                     if cancel.is_set():
                         finish = "cancel"
                 except EngineFault as e:                # (#827: the engine ended the answer itself, on an error)
@@ -5489,12 +5760,13 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                                         for c in calls]})
         messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
-        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked")}
-        sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
+        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked", "_starts")}
+        sampling = {k: v for k, v in (sampling or {}).items() if k not in ("_prefill", "_starts")}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
         sampling["_blocked"] = kw.get("_blocked")
         sampling["_think_resume"] = kw.get("_think_resume")
         sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
+        sampling["_think_after"] = kw.get("_think_after")      # (Inkling 2: what may follow a closed thinking)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -6266,6 +6538,8 @@ def make_handler(svc: Service):
                 return
             if not self._mapi_target(req.get("model")):
                 return
+            if kind == "chat":
+                check_messages(req)   # (the wrong shape: a ValueError, do_POST's 400)
             ka = model_api.parse_keep_alive(req.get("keep_alive"))
             name = model_api.public_name(Path(svc.config_path)) + ":latest" if svc.config_path else svc.model
             empty = not (req.get("messages") if kind == "chat" else (req.get("prompt") or req.get("images")))
@@ -6299,9 +6573,10 @@ def make_handler(svc: Service):
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
-                oreq = {**oreq, "_prefill": kw["_prefill"]}
+                oreq = {**oreq, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
-                    "_think_max": kw.get("_think_max")}         # (GLM-5.3: Max's long budget, Service.asked_max)
+                    "_think_max": kw.get("_think_max"),         # (GLM-5.3: Max's long budget, Service.asked_max)
+                    "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             cancel = threading.Event()
             watch_client(self, cancel)
             chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
@@ -6879,6 +7154,8 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                     return
                 if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+                    # (a list of messages of the wrong shape: a 400 in plain words before anything reads it)
+                    check_messages(req, "input" if path == "/v1/responses" else "messages")
                     # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
@@ -7167,9 +7444,11 @@ def make_handler(svc: Service):
                                                      guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                    sampling["_starts"] = kw.get("_starts")
                 sampling["_blocked"] = kw.get("_blocked")
                 sampling["_think_resume"] = kw.get("_think_resume")
                 sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
+                sampling["_think_after"] = kw.get("_think_after")      # (Inkling 2: what may follow a closed thinking)
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -7204,10 +7483,11 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             turn_mark("prepared")
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
+            req = {**req, "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -7302,10 +7582,11 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
+            req = {**req, "_think_after": kw.get("_think_after")}      # (Inkling 2: what may follow a closed thinking)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
@@ -7344,6 +7625,12 @@ class Server(ThreadingHTTPServer):
     # (MAYA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
 
+    def server_bind(self):
+        # http.server's own bind asks the resolver for the bound address's host name (socket.getfqdn) - nothing here uses
+        # it, and on a PC whose resolver is slow or down every start (and every test server) waited for it, tens of seconds
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
     def server_close(self):
         service = getattr(self, "response_service", None)
         try:
@@ -7376,6 +7663,21 @@ def apply_server_env(cfg: dict) -> None:
     REQUEST_QUIET_S = _quiet_seconds()
     DRAIN_S = _drain_seconds()
     Server.request_queue_size = _backlog()
+
+
+def ds4_one_gpu_switch_note(cfg: dict, env: dict) -> str | None:
+    """DS4_STREAM_WIN / DS4_LAND are the one-GPU decode path's switches, and that path is NVIDIA's (v1.1.27's stays on
+    other cards).  Set by hand for DeepSeek on one AMD GPU they forced it on a card the path was not made for: decode 19
+    -> 2 tok/s and a stalled answer (#1120).  The text to print at start for that case, else None.  Message only."""
+    if models.family(cfg) != "deepseek" or cfg.get("backend") != "hip" or len(gpu_list(cfg)) > 1:
+        return None
+    on = [k for k in ("DS4_STREAM_WIN", "DS4_LAND") if str(env.get(k) or "").strip() not in ("", "0")]
+    if not on:
+        return None
+    return ("[maya] NOTE: " + " and ".join(on) + (" is" if len(on) == 1 else " are") + " set, but the one-GPU decode "
+            "path they belong to is NVIDIA's: it does not apply to one AMD GPU, where the default is the earlier "
+            "decode path (the engine's line says so).  Forced on, they made decode much slower and stalled answers "
+            "(#1120).  Remove them (and DS4_STREAM_ZC) from the environment or the config's env to run as designed.")
 
 
 def warn_tight_ram(arena_mib) -> None:
@@ -7599,10 +7901,72 @@ def wait_for_stop(stop: threading.Event, step: float = 0.5) -> None:
         time.sleep(step)
 
 
+# The programs this server started that must not outlive it (the engine, the vision encoder).  A server that ends -
+# a signal while the engine loads, an exception, sys.exit - ends them on the way out (#1181: a SIGTERM during the load
+# left the engine alone, holding the GPUs and the RAM tier).
+_SPAWNED: list = []
+_STARTING = [True]          # until main() has the server up: a stop signal ends the engine and the server at once
+
+
+def track_spawned(proc) -> None:
+    """Register a program the server started (engine.stop / close still end it the usual way)."""
+    _SPAWNED[:] = [p for p in _SPAWNED if p.poll() is None]
+    _SPAWNED.append(proc)
+
+
+def end_spawned(grace: float = 5.0) -> None:
+    """End every program this server started that still runs, with what it started in turn: asked first (SIGTERM),
+    killed after `grace` seconds; on Windows the whole tree (taskkill /T) at once."""
+    procs = [p for p in _SPAWNED if p.poll() is None]
+    if not procs:
+        return
+    if os.name == "nt":
+        for p in procs:
+            try:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            try:
+                p.kill()
+            except OSError:
+                pass
+    else:
+        import signal
+        kids = []
+        for p in procs:
+            try:
+                import psutil
+                kids += psutil.Process(p.pid).children(recursive=True)
+            except Exception:  # noqa: BLE001 - no psutil: the child alone
+                pass
+        for p in procs:
+            with contextlib.suppress(OSError):
+                p.send_signal(signal.SIGTERM)
+        end = time.monotonic() + grace
+        for p in procs:
+            with contextlib.suppress(Exception):
+                p.wait(timeout=max(0.1, end - time.monotonic()))
+            if p.poll() is None:
+                with contextlib.suppress(OSError):
+                    p.kill()
+        for k in kids:
+            with contextlib.suppress(Exception):
+                if k.is_running():
+                    k.kill()
+    for p in procs:
+        with contextlib.suppress(Exception):
+            p.wait(timeout=10)
+
+
+atexit.register(end_spawned)
+
+
 def stop_signals(stop: threading.Event) -> None:
     """SIGTERM, SIGINT (Ctrl+C), SIGHUP (the terminal closed) and Windows' SIGBREAK (Ctrl+Break) stop the server
     (request_stop).  A later one is ignored while it stops - but a second Ctrl+C raises KeyboardInterrupt: at once.  A
-    signal that is ignored (nohup) stays ignored."""
+    signal that is ignored (nohup) stays ignored.  main() installs them before it starts the engine: one that comes
+    while the engine loads (nothing is serving yet, nothing to wrap up) ends the engine and the server right there."""
     import signal
 
     def on(signum, frame):
@@ -7611,6 +7975,9 @@ def stop_signals(stop: threading.Event) -> None:
                 raise KeyboardInterrupt
             return
         request_stop(stop, signal.Signals(signum).name)
+        if _STARTING[0]:
+            end_spawned()
+            raise SystemExit(128 + int(signum))
     for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
         sig = getattr(signal, name, None)
         try:
@@ -7770,6 +8137,9 @@ def main() -> int:
                          "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
                          "(on Linux also when its parent process ends)")
     a = ap.parse_args()
+    clean_stale_picture_dirs()
+    stop = threading.Event()
+    stop_signals(stop)                                  # before any engine starts (#1181); ends it if one comes then
     if a.engine == "strata":
         a.engine = "maya"
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
@@ -7828,6 +8198,8 @@ def main() -> int:
             print(link_line, flush=True)
         vision = None
         env = child_env(cfg)
+        if note := ds4_one_gpu_switch_note(cfg, env):
+            print(note, flush=True)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
             sampling_defaults = maya_quants.model_defaults(cfg)[0]
@@ -7837,31 +8209,17 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
                   flush=True)
-        vcfg = cfg.get("vision") or None
-        vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
-        venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
-        # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
-        # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
-        engine_env = env
+        vcfg_in = cfg.get("vision") or None
+        vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg_in else None
+        # pictures: the encoder's environment, whether it runs on demand, and the engine's environment (one function,
+        # also the bench's: tools/maya_bench.py start_command)
+        vcfg, venv, on_demand, fp, engine_env = vision_plan(cfg, env, Path(a.config).resolve().with_name("vision-memory.json"))
         if on_demand:
-            fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
-                                  (gpu_list(cfg) or [0])[0])
-            if fp is None:
-                print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
-                      flush=True)
-                vcfg, on_demand = dict(vcfg, gpu=False), False
-            else:
-                vcfg = dict(vcfg, max_tokens=fp[0])
-                if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
-                    engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                else:   # (... and its drafting leaves the room the encoder would have had on the GPU: IK2_VISION_GIB)
-                    engine_env = dict(env, IK2_VISION_GIB=f"{fp[1] / 2**30:.3f}")
-                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
-                      "image tokens", flush=True)
+            print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
+                  "image tokens", flush=True)
+        elif vcfg_in and vcfg_in.get("gpu") and vcfg and not vcfg.get("gpu"):
+            print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
+                  flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
@@ -7890,7 +8248,7 @@ def main() -> int:
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
             vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
+                                       picture_dir("maya-ds4-pictures-"), Vision.load)
             room = engine.info.get("vision_room")
             where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
                      f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
@@ -7900,7 +8258,7 @@ def main() -> int:
         elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-hy4-pictures-")), Vision.load)
+                                       picture_dir("maya-hy4-pictures-"), Vision.load)
             # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
             where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
                      "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
@@ -7909,7 +8267,7 @@ def main() -> int:
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
+                                       picture_dir("maya-mm3-pictures-"), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
                   f"({vision.g.max_tokens} tokens) a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":
@@ -7969,7 +8327,8 @@ def main() -> int:
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
-                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
+                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else
+                           0 if getattr(svc.template, "inkling", False) else 32768)         if svc.has_think_budget else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
     # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
@@ -8077,8 +8436,7 @@ def main() -> int:
     # conversation.  A second signal while that runs (systemd signals the whole group, then the supervisor again) is
     # ignored instead of cutting it short - except a second Ctrl+C, which ends the server at once (the engine then ends
     # when its input closes).
-    stop = threading.Event()
-    stop_signals(stop)
+    _STARTING[0] = False                                # (the signals were installed before the engine started)
     if a.parent_pipe:
         watch_parent(lambda why: request_stop(stop, why))
     try:

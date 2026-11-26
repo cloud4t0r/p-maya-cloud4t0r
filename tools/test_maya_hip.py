@@ -355,6 +355,7 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"], {
             "MAYA_GLM_SPLIT": "0", "MAYA_GLM_RESERVE_MB": "3072", "MAYA_GLM_RAM_HEADROOM_GB": "16",
+            "MAYA_VRAM_RESERVE_SETUP_MB": "3072",   # (#1156: the reserve is the setup's own)
             "MAYA_GLM_PREFILL_SUB": "1024", "MAYA_GLM_PREFILL_MB": "4096"})
         self.assertFalse(maya.hip_unified_memory(self.gpus[1]))
 
@@ -1148,6 +1149,58 @@ class UbuntuRocwmmaNote(unittest.TestCase):
         for words in ("librocwmma-dev", "internal/accessors.hpp", "ROCm/rocWMMA", "CPLUS_INCLUDE_PATH",
                       "repo.radeon.com"):
             self.assertIn(words, text)
+
+
+class VisionBackendSwitch(unittest.TestCase):
+    """One folder set up with --backend hip, then --backend cuda: build-vision's CMake cache has MAYA_VISION_HIP=ON
+    and the configure stopped at CMakeLists.txt:53 ("mutually exclusive"); the old build is set aside now."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.vb = self.root / "build-vision"
+        self.vb.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def cache(self, d: Path, hip: bool):
+        d.mkdir(exist_ok=True)
+        (d / "CMakeCache.txt").write_text(f"MAYA_VISION_HIP:BOOL={'ON' if hip else 'OFF'}" + chr(10) +
+                                          f"MAYA_VISION_CUDA:BOOL={'OFF' if hip else 'ON'}" + chr(10))
+
+    def test_backend_read_from_the_cache(self):
+        self.assertIsNone(maya.vision_build_backend(self.vb))
+        self.cache(self.vb, hip=True)
+        self.assertEqual(maya.vision_build_backend(self.vb), "hip")
+        self.cache(self.vb, hip=False)
+        self.assertEqual(maya.vision_build_backend(self.vb), "cuda")
+
+    def test_other_backend_is_set_aside_and_comes_back(self):
+        self.cache(self.vb, hip=True)
+        with patch.object(maya, "VBUILD", self.vb), patch.object(maya, "say"):
+            maya.vision_build_for("cuda")
+            self.assertFalse((self.vb / "CMakeCache.txt").exists())
+            self.assertEqual(maya.vision_build_backend(self.root / "build-vision-hip"), "hip")
+            self.cache(self.vb, hip=False)               # (the cuda build)
+            maya.vision_build_for("hip")                  # (back: the hip build is the build-vision again)
+            self.assertEqual(maya.vision_build_backend(self.vb), "hip")
+            self.assertEqual(maya.vision_build_backend(self.root / "build-vision-cuda"), "cuda")
+
+    def test_same_backend_or_no_cache_untouched(self):
+        with patch.object(maya, "VBUILD", self.vb), patch.object(maya, "say"):
+            maya.vision_build_for("cuda")
+            self.cache(self.vb, hip=False)
+            maya.vision_build_for("cuda")
+        self.assertEqual(maya.vision_build_backend(self.vb), "cuda")
+        self.assertFalse((self.root / "build-vision-cuda").exists())
+
+    def test_configure_names_both_switches(self):
+        steps = []
+        pc = {"backend": "cuda", "nvcc": "/usr/bin/nvcc", "archs": ["70"], "gpus": [{}]}
+        with patch.object(maya, "VBUILD", self.vb), patch.object(maya, "run"),              patch.object(maya, "VSTAMP", self.vb / "stamp.json"), patch.object(maya, "VEXE", self.vb / "bin" / "v"),              patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "say"),              patch.object(maya, "cmake_steps", side_effect=lambda *x, **k: steps.append(x) or None):
+            maya.compile_vision(pc, {}, self.root / "llama.cpp", "abc")
+        conf = steps[0][0]
+        self.assertIn("-DMAYA_VISION_CUDA=ON", conf)
+        self.assertIn("-DMAYA_VISION_HIP=OFF", conf)
 
 
 if __name__ == "__main__":

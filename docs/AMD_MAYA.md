@@ -230,7 +230,7 @@ Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo,
 
 **If it does not work.** A start that stops, an answer that never comes (the engine waiting with the GPU idle) or answers that look wrong: please open an issue with your GPU, Windows version, the setup's output and the engine's log from the start (its first line says the platform is experimental), and, if it stops or hangs, whether it runs with `"GPU_FLUSH_ON_EXECUTION": "1"` in the config's `"env"` (AMD's runtime then sends the GPU its work at once - slower, but it tells us where to look). Meanwhile: turn drafting off (`--drafting off` at the setup), or run Hy4-Flash on Linux on the same PC (see above), or pick another model - GLM-5.3-Flash and DeepSeek-V4.1-Flash have been run on AMD under Windows.
 
-### Inkling-2-Mini (experimental preview)
+### Inkling-2-Mini
 
 `./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA GPU
 (gfx10 / gfx11 / gfx12) with 12 GB of VRAM or more - RDNA 1 / 2 cards (RX 5000 / 6000) take the portable kernels, no
@@ -238,15 +238,13 @@ matrix cores; under 24 GB the experts the card does not hold stay in RAM (about 
 of RAM with a 12 GB card) - or a Strix Halo / Gorgon Halo, whose memory is the RAM and holds the whole model (the
 setup counts what the system leaves, less max(8 GB, 10%)). Two cards run the split (the first holds the dense weights,
 the cache, every prompt and most of the experts, the second the experts it does not; mixed generations too - an
-RDNA 3 / 3.5 / 4 card first is faster, the setup offers it so) - not validated on AMD yet. Run
-by Maya's team on a
-Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
-starts; Radeon RX 5000 / 6000 / 7000 / 9000 cards build the same engine - RDNA 1 / 2 (gfx1030) takes the portable
-kernels, no matrix cores. Two cards ran the split on two 16 GB cards (an RX 6800 gfx1030 + an RX 9070 gfx1201, Linux):
-about 64 tok/s with the RDNA 4 card first against 44 with the RDNA 2 card first (32K context, FP8 cache, 8 tokens;
-not validated on AMD yet). Older AMD GPUs
-(the GCN cards) and AMD
-under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
+RDNA 3 / 3.5 / 4 card first is faster, the setup offers it so): it ran on an RX 6800 (gfx1030) + an RX 9070
+(gfx1201), about 64 tok/s with the RDNA 4 card first against 44 with the RDNA 2 one (32K context, FP8 cache, 8
+tokens), but two AMD cards are not validated yet. Maya's team runs it on a Radeon 8065S (Gorgon Halo, Ubuntu, ROCm
+7.1): text, thinking, tool calls and pictures, the same greedy answers over starts; Radeon RX 5000 / 6000 / 7000 /
+9000 cards build the same engine - RDNA 1 / 2 (gfx1030) takes the portable kernels, no matrix cores. Older AMD GPUs
+(the GCN cards) and AMD under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD
+paths.
 
 ## Instinct MI300X / MI325X
 

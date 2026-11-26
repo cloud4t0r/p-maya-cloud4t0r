@@ -115,6 +115,29 @@ class Api(Served):
         self.assertIn("hello", b["response"])
         self.assertEqual(self.req("POST", "/api/chat", {"model": "nope", "messages": [{"role": "user", "content": "x"}]})[0], 404)
 
+    def test_messages_of_the_wrong_shape_are_a_400(self):
+        """A `messages` list with an item that is no object (or no list at all): a 400 in plain words on the OpenAI
+        path, the Anthropic one, the Responses one and Maya's model API - no AttributeError, no dropped connection."""
+        import contextlib
+        import io
+        good = {"role": "user", "content": "hi"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for path, key in (("/v1/chat/completions", "messages"), ("/v1/messages", "messages"),
+                              ("/v1/responses", "input"), ("/api/chat", "messages")):
+                for bad, word in (([good, 7], f"`{key}[1]` must be an object"), (["hi"], f"`{key}[0]` must be an object"),
+                                  ([None], "not null"), ({"role": "user"}, f"`{key}` must be a list")):
+                    body = {"model": self.run_name, "max_tokens": 8, "stream": False, key: bad}
+                    s, text, _ = self.raw("POST", path, body)
+                    self.assertEqual(s, 400, (path, bad, text))
+                    e = json.loads(text)["error"]
+                    msg = e if isinstance(e, str) else e["message"]
+                    self.assertIn(word, msg, (path, bad))
+                    self.assertNotIn("AttributeError", msg)
+        self.assertNotIn("Traceback", err.getvalue())
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False, "messages": [good]})
+        self.assertEqual((s, b["done"]), (200, True))   # (the server answers on)
+
     def test_think_false_turns_thinking_off(self):
         """"think": false reaches the template as enable_thinking False, also over the web app's shared thinking level;
         true or no "think" leave thinking on (v1.1.56 dropped the false: thinking stayed on)."""
@@ -402,8 +425,8 @@ class OtherQuantsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
-    def test_inkling_2_mini_preview(self):
-        """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
+    def test_inkling_2_mini_note(self):
+        """Inkling-2-Mini (maya-ik2): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
         said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
         a Mac); its setup id on the command line; the size the setup's manifest says."""
         with mock.patch.object(model_pull.sys, "platform", "linux"):
@@ -411,8 +434,8 @@ class OtherQuantsTest(unittest.TestCase):
             ik = c["inkling-2-mini"]
             self.assertEqual((ik["family"], ik["group"], ik["by"]), ("ik2", "other", "unsloth"))
             self.assertEqual(ik["name"], "Inkling 2 Mini · unsloth UD-Q4_K_XL")
-            self.assertIn("experimental preview", ik["note"])
-            self.assertIn("24 GB", ik["note"])
+            self.assertIn("an NVIDIA GPU of 8 GB or more", ik["note"])
+            self.assertIn("8 GB or more", ik["note"])
             self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: IK2_MIN_CC)
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70,))})      # (a V100: Volta on)
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=(70, 89))})
