@@ -1272,24 +1272,21 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (const char* v = getenv("MAYA_GLM_PREFILL_SUB"))
         S->sub_env = std::clamp(std::atoi(v), 16, 8192);
 #if defined(MAYA_USE_HIP)
-    // RDNA 2 (gfx103x): a prompt GEMM (hgemm_q) whose sub-batch passes 64 tokens comes back wrong on these cards - the
-    // tokens past the 64th carry garbage (NaN among it: a few dozen of the 4096 columns of a row, the set changing run
-    // to run) and the router then rejects them ("glm router: prompt layer 3 invalid expert ID or non-finite score",
-    // 256 routes of 520 on an RX 6800 / ROCm 7.0, for any prompt whose chunk passes 64 tokens - the first MoE layer is
-    // only where it shows).  64-token sub-batches are exact.  Measured on that card, and it is NOT the GEMM:
-    // hipBLAS/rocBLAS reproduces the same shapes exactly outside the engine (Tn 64/65/66 against a naive reference:
-    // 0 of 266,240 values off), the weight scratch's device-side hash is unchanged across 197 and 217 watched GEMMs,
-    // the GEMM's input is bit-identical before and after, and the same GEMM run twice back to back into two buffers
-    // returns the first corrupted (32 rows x 48 columns, NaN) and the second exact.  So a foreign write lands in the
-    // prompt's activation buffer while its GEMM fills it - one that a host sync between sub-batches is enough to keep
-    // out, i.e. a stream-ordering defect and not arithmetic; the shorter sub-batch is the window, not the cure.  Other
-    // cards take the tuned routes and keep kSub.  MAYA_GLM_PREFILL_SUB still wins.
+    // RDNA 2 (gfx103x): hipBLAS (rocBLAS 7.16) picks an ATOMIC Tensile kernel for hgemm_q's FP16-in / FP32-out GEMMs
+    // once a sub-batch passes 64 tokens - measured: Cijk_..._MT64x32x8_SE_AMAS2_... at 68 against
+    // Cijk_..._MT128x32x16_SE_AMAS0_... at 64 - and that kernel leaves a few hundred of the result's cells at their
+    // previous content (beta = 0 does not fill them).  Those cells carry the previous layer's values, the mHC RMS norm
+    // spreads each over its whole row, and the first MoE layer's router rejects the tokens ("glm router: prompt layer 3
+    // invalid expert ID or non-finite score", 256 of 520 routes on an RX 6800, for every prompt whose chunk passes 64
+    // tokens).  The second call of the same GEMM looks right only because its "previous content" is the first call's
+    // almost-correct result.  64-token sub-batches take the non-atomic kernel and are exact; other cards keep kSub.
+    // MAYA_GLM_PREFILL_SUB still wins.
     if (S->sub_env == 0) {
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, dev_) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
             S->sub_env = 64;
-            std::fprintf(stderr, "glm prefill: CUDA%d %s: sub-batches of 64 tokens (a longer prompt GEMM's buffer is "
-                                 "written from elsewhere on RDNA 2)\n", dev_, prop.gcnArchName);
+            std::fprintf(stderr, "glm prefill: CUDA%d %s: sub-batches of 64 tokens (longer ones take hipBLAS's atomic "
+                                 "Tensile kernel, which fills only part of a beta = 0 result)\n", dev_, prop.gcnArchName);
         }
     }
 #endif
